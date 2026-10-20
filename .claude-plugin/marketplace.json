@@ -1,0 +1,24 @@
+{
+  "name": "gograph",
+  "owner": {
+    "name": "ozgurcd",
+    "url": "https://github.com/ozgurcd"
+  },
+  "metadata": {
+    "description": "Marketplace hosting the gograph Claude Code plugin - Go repository intelligence via MCP."
+  },
+  "plugins": [
+    {
+      "name": "gograph",
+      "description": "Claude Code workflow guidance for local gograph: AST-aware call graphs, impact, security-flow candidates, and 61 query, analysis, and workflow capabilities through a separately registered MCP server.",
+      "version": "0.1.0",
+      "author": {
+        "name": "ozgurcd",
+        "url": "https://github.com/ozgurcd"
+      },
+      "source": "./",
+      "category": "developer-tools",
+      "homepage": "https://gograph.identuum.ai"
+    }
+  ]
+}

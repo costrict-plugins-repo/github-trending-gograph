@@ -1,0 +1,37 @@
+.gograph/
+.agents/
+bin/
+bin/gograph-test
+/gograph
+docs/ARCHITECTURAL_GUIDELINES.md
+coverage.out
+.release-mcpb/
+.release-work/
+dist/
+
+# local agent instructions
+CLAUDE.md
+.DS_Store
+.cursor
+.obsidian
+codeql-db/
+
+demo.tape
+gograph.mp4
+gograph.gif
+
+llm-wiki.legacy/
+raw/
+
+# llm-wiki generated pages
+llm-wiki/overview.md
+llm-wiki/architecture.md
+llm-wiki/hotspots.md
+llm-wiki/env.md
+llm-wiki/errors.md
+llm-wiki/concurrency.md
+llm-wiki/api-surface.md
+llm-wiki/packages/*
+!llm-wiki/packages/README.md
+opencode.json
+docs/private

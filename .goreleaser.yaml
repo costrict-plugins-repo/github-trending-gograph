@@ -1,0 +1,70 @@
+version: 2
+project_name: gograph
+before:
+  hooks:
+    - go mod tidy
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    main: ./cmd/gograph
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.releaseVersionMarker=gograph-release-version=/{{.Version}}/
+archives:
+  - formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+checksum:
+  name_template: 'checksums.txt'
+  extra_files:
+    - glob: ./.release-mcpb/*.mcpb
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+release:
+  header: |
+    Windows binaries are no longer built or published; macOS and Linux targets are unchanged.
+  # MCP bundles are built and verified before GoReleaser starts. Keep them
+  # outside dist/ because `release --clean` removes that directory.
+  extra_files:
+    - glob: ./.release-mcpb/*.mcpb
+    - glob: ./server.json
+  # Published release assets are immutable. The workflow verifies a complete
+  # matching release as a no-op and fails on a partial or divergent release.
+  replace_existing_artifacts: false
+
+homebrew_casks:
+  - name: gograph
+    # The release workflow publishes this generated cask idempotently after
+    # GitHub assets are final. This keeps tap failures safely rerunnable.
+    skip_upload: true
+    repository:
+      owner: ozgurcd
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/ozgurcd/gograph"
+    description: "Fast, AST-based repository structure and call graph analyzer for Go"
+    binaries:
+      - gograph
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/gograph"]
+          end

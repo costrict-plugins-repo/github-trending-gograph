@@ -1,0 +1,156 @@
+package baseline_test
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ozgurcd/gograph/internal/baseline"
+	"github.com/ozgurcd/gograph/internal/graph"
+	"github.com/ozgurcd/gograph/internal/sourcefs"
+)
+
+func TestBuildRejectsOversizedSavedGraphBeforeDecode(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "saved.json")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o640)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(graph.MaxArtifactBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = baseline.Build(context.Background(), root, "saved.json", func(string) (*graph.Graph, error) {
+		t.Fatal("saved graph should not invoke source builder")
+		return nil, nil
+	})
+	if !errors.Is(err, sourcefs.ErrFileTooLarge) {
+		t.Fatalf("oversized saved graph error = %v, want ErrFileTooLarge", err)
+	}
+}
+
+func TestBuildExtractsProjectSubtreeAtGitRef(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "services", "api")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(root, "outside.go"), "package outside\n")
+	writeFile(t, filepath.Join(project, "go.mod"), "module example.com/api\n")
+	writeFile(t, filepath.Join(project, "main.go"), "package main\n\nfunc Baseline() {}\n")
+	runGit(t, root, "init", "--quiet")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "Test User")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "--quiet", "-m", "baseline")
+	writeFile(t, filepath.Join(project, "main.go"), "package main\n\nfunc Current() {}\n")
+
+	var buildRoot string
+	g, err := baseline.Build(context.Background(), project, "HEAD", func(path string) (*graph.Graph, error) {
+		buildRoot = path
+		data, readErr := os.ReadFile(filepath.Join(path, "main.go"))
+		if readErr != nil {
+			return nil, readErr
+		}
+		if !strings.Contains(string(data), "Baseline") {
+			t.Fatalf("expected committed source, got %s", data)
+		}
+		if _, statErr := os.Stat(filepath.Join(path, "outside.go")); !os.IsNotExist(statErr) {
+			t.Fatalf("baseline build escaped project subtree: %v", statErr)
+		}
+		return &graph.Graph{Root: path}, nil
+	})
+	if err != nil {
+		t.Fatalf("build baseline: %v", err)
+	}
+	if g.Root != buildRoot {
+		t.Fatalf("graph root = %q, want %q", g.Root, buildRoot)
+	}
+	if _, err := os.Stat(buildRoot); !os.IsNotExist(err) {
+		t.Fatalf("temporary baseline directory was not removed: %v", err)
+	}
+}
+
+func TestBuildRejectsUnsafeRef(t *testing.T) {
+	_, err := baseline.Build(context.Background(), t.TempDir(), "main;echo bad", func(string) (*graph.Graph, error) {
+		return &graph.Graph{}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsafe baseline ref") {
+		t.Fatalf("expected unsafe-ref error, got %v", err)
+	}
+}
+
+func TestBuildRejectsLegacySavedGraph(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "legacy.json"), `{"version":"2","build":{"complete":true}}`)
+	_, err := baseline.Build(context.Background(), root, "legacy.json", func(string) (*graph.Graph, error) {
+		t.Fatal("saved graph should not invoke source builder")
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported repository source policy") {
+		t.Fatalf("legacy saved graph error = %v", err)
+	}
+}
+
+func TestBuildRejectsSavedGraphOutsideProject(t *testing.T) {
+	base := t.TempDir()
+	project := filepath.Join(base, "project")
+	if err := os.Mkdir(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(base, "outside.json"), `{"version":"2","build":{"source_policy_version":1}}`)
+	_, err := baseline.Build(context.Background(), project, "../outside.json", func(string) (*graph.Graph, error) {
+		t.Fatal("saved graph should not invoke source builder")
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "inside project root") {
+		t.Fatalf("outside saved graph error = %v", err)
+	}
+}
+
+func TestBuildRejectsLinkedSavedGraph(t *testing.T) {
+	base := t.TempDir()
+	project := filepath.Join(base, "project")
+	if err := os.Mkdir(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "outside.json")
+	writeFile(t, outside, `{"version":"2","build":{"source_policy_version":1}}`)
+	if err := os.Symlink(outside, filepath.Join(project, "baseline.json")); err != nil {
+		t.Skipf("create baseline symlink: %v", err)
+	}
+	_, err := baseline.Build(context.Background(), project, "baseline.json", func(string) (*graph.Graph, error) {
+		t.Fatal("saved graph should not invoke source builder")
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsafe repository source path") {
+		t.Fatalf("linked saved graph error = %v", err)
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}

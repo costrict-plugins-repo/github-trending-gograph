@@ -1,0 +1,565 @@
+package cli
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/ozgurcd/gograph/internal/buildctx"
+	"github.com/ozgurcd/gograph/internal/graph"
+	"github.com/ozgurcd/gograph/internal/mcp"
+	"github.com/ozgurcd/gograph/internal/memorylimit"
+	"github.com/ozgurcd/gograph/internal/search"
+	"github.com/ozgurcd/gograph/internal/session"
+	"github.com/ozgurcd/gograph/internal/sourcefs"
+	workspacegraph "github.com/ozgurcd/gograph/internal/workspace"
+)
+
+type workspaceMutation struct {
+	RepositoryID      string `json:"repository_id"`
+	Path              string `json:"path"`
+	BeforeFingerprint string `json:"before_fingerprint"`
+	AfterFingerprint  string `json:"after_fingerprint"`
+	Error             string `json:"error,omitempty"`
+}
+
+type workspaceBuildResult struct {
+	SchemaVersion       string              `json:"schema_version"`
+	WorkspaceName       string              `json:"workspace_name"`
+	InputFingerprint    string              `json:"input_fingerprint,omitempty"`
+	ArtifactFingerprint string              `json:"artifact_fingerprint,omitempty"`
+	OverlayPublished    bool                `json:"overlay_published"`
+	RefreshPlan         []workspaceMutation `json:"refresh_plan"`
+	RefreshAttempted    []workspaceMutation `json:"refresh_attempted"`
+	RefreshSucceeded    []workspaceMutation `json:"refresh_succeeded"`
+	RefreshFailed       []workspaceMutation `json:"refresh_failed"`
+}
+
+func runWorkspace(args []string) int {
+	if len(args) == 0 {
+		return failCommand("workspace", "usage: gograph workspace <build|status|query|path|impact|mcp> [args]")
+	}
+	switch args[0] {
+	case "build":
+		return runWorkspaceBuild(args[1:])
+	case "status":
+		return runWorkspaceStatus(args[1:])
+	case "query":
+		return runWorkspaceQuery(args[1:])
+	case "path":
+		return runWorkspacePath(args[1:])
+	case "impact":
+		return runWorkspaceImpact(args[1:])
+	case "mcp":
+		return runWorkspaceMCP(args[1:])
+	default:
+		return failCommandf("workspace", "unknown workspace command %q", args[0])
+	}
+}
+
+func printWorkspaceHelp() {
+	fmt.Print(`USAGE
+  gograph workspace <build|status|query|path|impact|mcp> [arguments]
+
+COMMANDS
+  build [path] [--refresh-members] [--tags=<tags>] [memory flags]
+  status [path] [--tags=<tags>]
+  query [--scope id] [--workspace path] [--tags=<tags>] <term...>
+  path [--scope id] [--workspace path] [--tags=<tags>] [--include-possible] <from> <to>
+  impact [--scope id] [--workspace path] [--tags=<tags>] [--include-possible] <target>
+  mcp [path] [--tags=<tags>]
+
+PATH RANKING
+  Competing paths prefer exact over ambiguous/possible evidence, then shorter
+  paths, production over tests, typed resolution over heuristics, and fewer
+  cross-repository transitions. Canonical tie-breaking is deterministic.
+
+MANIFEST
+  The checked-in .gograph-workspace.yml establishes the workspace root.
+  Member paths must be unique, relative, non-linked directories confined beneath it.
+
+  schema_version: gograph.workspace-manifest.v1
+  name: my-workspace
+  default_scope: oss
+  repositories:
+    - id: api
+      path: services/api
+      precision: precise
+      exclude_dirs: [legacy, examples/broken]
+      services:
+        - id: api-service
+          http:
+            authorities: [api.internal]
+    - id: client
+      path: services/client
+      http_clients:
+        - base: env:API_URL
+          authority_id: api-service
+          path_prefix: /v1
+  scopes:
+    - id: oss
+      repositories: [api, client]
+
+  http_clients explicitly maps lexical URL bases (cfg.API or env:API_URL) to
+  logical service IDs. No environment values are read. Bounded static suffixes
+  resolve only inside the selected scope; request construction is possible,
+  not dispatch proof. Query returns http_unresolved diagnostics; status reports
+  verified per-scope counts. Unresolved records are never traversable edges.
+
+  exclude_dirs contains literal member-relative directory subtrees to omit
+  from AST/precise targets. It is fingerprinted and used by member refreshes
+  and CLI/MCP validation. Imported dependencies and safety checks still apply.
+
+  See docs/workspaces.md in the source tree, or:
+  https://gograph.identuum.ai/docs/command-reference/#federated-workspaces
+`)
+}
+
+func runWorkspaceBuild(args []string) int {
+	start := "."
+	startSet := false
+	refreshMembers := false
+	var buildTags []string
+	memoryPolicy := memorylimit.Standard()
+	for index := 0; index < len(args); index++ {
+		argument := args[index]
+		handled, consumedThrough, tagsErr := parseBuildTagsOption(args, index, &buildTags)
+		if tagsErr != nil {
+			return failCommandf("workspace build", "invalid build tags: %v", tagsErr)
+		}
+		if handled {
+			index = consumedThrough
+			continue
+		}
+		handled, consumedThrough, memoryErr := parseMemoryOption(args, index, &memoryPolicy)
+		if memoryErr != nil {
+			return failCommandf("workspace build", "invalid memory policy: %v", memoryErr)
+		}
+		if handled {
+			index = consumedThrough
+			continue
+		}
+		switch {
+		case argument == "--refresh-members":
+			refreshMembers = true
+		case strings.HasPrefix(argument, "-"):
+			return failCommandf("workspace build", "unknown argument: %s", argument)
+		case !startSet:
+			start = argument
+			startSet = true
+		default:
+			return failCommand("workspace build", "usage: gograph workspace build [path] [--refresh-members] [--tags=integration] [--memory-mode=low] [--max-memory=1GiB]")
+		}
+	}
+	if err := memoryPolicy.Validate(); err != nil {
+		return failCommandf("workspace build", "invalid memory policy: %v", err)
+	}
+	buildTags, err := buildctx.NormalizeBuildTags(buildTags)
+	if err != nil {
+		return failCommandf("workspace build", "invalid --tags: %v", err)
+	}
+	controller, err := memorylimit.Apply(memoryPolicy)
+	if err != nil {
+		return failCommandf("workspace build", "invalid memory policy: %v", err)
+	}
+	defer controller.Restore()
+	root, err := workspacegraph.FindRoot(start)
+	if err != nil {
+		return failCommand("workspace build", err.Error())
+	}
+	if err := session.GuardCallerMutationAt(root, callerSessionID); err != nil {
+		return failCommand("workspace build", err.Error())
+	}
+	manifest, _, err := workspacegraph.LoadManifest(root)
+	if err != nil {
+		return failCommand("workspace build", err.Error())
+	}
+	result := workspaceBuildResult{SchemaVersion: "gograph.workspace-build.v1", WorkspaceName: manifest.Name, RefreshPlan: []workspaceMutation{}, RefreshAttempted: []workspaceMutation{}, RefreshSucceeded: []workspaceMutation{}, RefreshFailed: []workspaceMutation{}}
+	inspections := workspacegraph.InspectMembersWithBuildTags(context.Background(), root, manifest, buildTags)
+	for _, inspection := range inspections {
+		if inspection.Error == nil {
+			continue
+		}
+		result.RefreshPlan = append(result.RefreshPlan, workspaceMutation{RepositoryID: inspection.Config.ID, Path: inspection.Config.Path, BeforeFingerprint: graphArtifactFingerprint(inspection.Root)})
+	}
+	if len(result.RefreshPlan) > 0 && !refreshMembers {
+		message := fmt.Sprintf("%d member graph(s) require refresh; rerun with --refresh-members to permit multi-repository mutation", len(result.RefreshPlan))
+		return writeWorkspaceBuildFailure(result, message)
+	}
+	if refreshMembers {
+		for _, planned := range result.RefreshPlan {
+			attempt := planned
+			result.RefreshAttempted = append(result.RefreshAttempted, attempt)
+			config, _ := workspacegraph.RepositoryByID(manifest, planned.RepositoryID)
+			memberRoot, rootErr := workspacegraph.ResolveMemberRoot(root, config)
+			if rootErr != nil {
+				attempt.Error = rootErr.Error()
+				result.RefreshFailed = append(result.RefreshFailed, attempt)
+				return writeWorkspaceBuildFailure(result, fmt.Sprintf("refresh repository %q: %v", config.ID, rootErr))
+			}
+			if err := session.GuardCallerMutationAt(memberRoot, callerSessionID); err != nil {
+				attempt.Error = err.Error()
+				result.RefreshFailed = append(result.RefreshFailed, attempt)
+				return writeWorkspaceBuildFailure(result, err.Error())
+			}
+			controller.Reclaim()
+			if err := refreshWorkspaceMember(memberRoot, config.Precision == "precise", memoryPolicy, buildTags, config.ExcludeDirs); err != nil {
+				attempt.Error = err.Error()
+				attempt.AfterFingerprint = graphArtifactFingerprint(memberRoot)
+				result.RefreshFailed = append(result.RefreshFailed, attempt)
+				return writeWorkspaceBuildFailure(result, fmt.Sprintf("refresh repository %q: %v", config.ID, err))
+			}
+			attempt.AfterFingerprint = graphArtifactFingerprint(memberRoot)
+			if inspection := workspacegraph.InspectMemberWithBuildTags(context.Background(), root, config, buildTags); inspection.Error != nil {
+				attempt.Error = inspection.Error.Error()
+				result.RefreshFailed = append(result.RefreshFailed, attempt)
+				return writeWorkspaceBuildFailure(result, fmt.Sprintf("refreshed repository %q is unusable: %v", config.ID, inspection.Error))
+			}
+			result.RefreshSucceeded = append(result.RefreshSucceeded, attempt)
+		}
+	}
+	members, err := workspacegraph.LoadMembersWithBuildTags(context.Background(), root, manifest, buildTags)
+	if err != nil {
+		return writeWorkspaceBuildFailure(result, err.Error())
+	}
+	artifact, err := workspacegraph.Resolve(manifest, members)
+	if err != nil {
+		return writeWorkspaceBuildFailure(result, err.Error())
+	}
+	if err := workspacegraph.Publish(root, artifact); err != nil {
+		return writeWorkspaceBuildFailure(result, err.Error())
+	}
+	_, artifactFingerprint, err := workspacegraph.LoadArtifact(root)
+	if err != nil {
+		return writeWorkspaceBuildFailure(result, err.Error())
+	}
+	result.InputFingerprint = artifact.InputFingerprint
+	result.ArtifactFingerprint = artifactFingerprint
+	result.OverlayPublished = true
+	if jsonMode {
+		return PrintJSON(okEnvelope("workspace build", manifest.Name, result, 1))
+	}
+	fmt.Printf("Workspace %s overlay published.\n", manifest.Name)
+	fmt.Printf("  input fingerprint: %s\n", result.InputFingerprint)
+	fmt.Printf("  artifact fingerprint: %s\n", result.ArtifactFingerprint)
+	if len(result.RefreshSucceeded) > 0 {
+		fmt.Printf("  refreshed member graphs: %d\n", len(result.RefreshSucceeded))
+	}
+	return 0
+}
+
+func writeWorkspaceBuildFailure(result workspaceBuildResult, message string) int {
+	if jsonMode {
+		envelope := errEnvelope("workspace build", message)
+		envelope.Results = result
+		return PrintJSON(envelope)
+	}
+	fmt.Fprintln(os.Stderr, message)
+	if len(result.RefreshPlan) > 0 {
+		fmt.Fprintln(os.Stderr, "refresh plan:")
+		for _, mutation := range result.RefreshPlan {
+			fmt.Fprintf(os.Stderr, "  %s (%s)\n", mutation.RepositoryID, mutation.Path)
+		}
+	}
+	for _, mutation := range result.RefreshSucceeded {
+		fmt.Fprintf(os.Stderr, "refreshed before failure: %s (%s -> %s)\n", mutation.RepositoryID, mutation.BeforeFingerprint, mutation.AfterFingerprint)
+	}
+	return 1
+}
+
+func refreshWorkspaceMember(root string, preciseMode bool, memoryPolicy memorylimit.Policy, buildTags []string, exclusions ...[]string) error {
+	buildConfig, configErr := resolveBuildConfigWithTags(root, buildTags, exclusions...)
+	previous, _ := loadGraph(root)
+	g, err := buildGraphWithConfig(root, buildConfig, configErr, previous)
+	if err != nil {
+		return err
+	}
+	if preciseMode {
+		if err := enrichGraphPreciselyWithMemory(root, g, buildConfig, configErr, memoryPolicy); err != nil {
+			return fmt.Errorf("precise enrichment failed: %w", err)
+		}
+	}
+	sortGraph(g)
+	if err := refreshCompleteGraphSourceFingerprint(root, g, buildConfig); err != nil {
+		return err
+	}
+	_, err = publishGraphArtifactsWithFreshness(root, g, manualArtifactPublication, func(candidate *graph.Graph, candidateRoot string) search.StaleResult {
+		return search.StaleWithConfig(candidate, candidateRoot, buildConfig)
+	})
+	return err
+}
+
+func graphArtifactFingerprint(root string) string {
+	reader, err := sourcefs.Open(root)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = reader.Close() }()
+	data, err := reader.ReadRegularFileLimit(".gograph/graph.json", graph.MaxArtifactBytes)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func runWorkspaceStatus(args []string) int {
+	start, buildTags, err := parseWorkspaceStartAndTags(args, "workspace status")
+	if err != nil {
+		return failCommand("workspace status", err.Error())
+	}
+	root, err := workspacegraph.FindRoot(start)
+	if err != nil {
+		return failCommand("workspace status", err.Error())
+	}
+	manifest, _, err := workspacegraph.LoadManifest(root)
+	if err != nil {
+		return failCommand("workspace status", err.Error())
+	}
+	status := workspacegraph.InspectStatusWithBuildTags(context.Background(), root, manifest, buildTags)
+	if jsonMode {
+		return PrintJSON(okEnvelope("workspace status", manifest.Name, status, len(status.Members)))
+	}
+	fmt.Printf("Workspace %s: %s\n", status.WorkspaceName, status.AggregateState)
+	for _, member := range status.Members {
+		state := "fresh"
+		if !member.Available {
+			state = "unavailable"
+		} else if !member.Fresh {
+			state = "stale"
+		}
+		fmt.Printf("  %-20s %s (%s)\n", member.RepositoryID, state, member.AnalysisMode)
+		for _, diagnostic := range member.Diagnostics {
+			fmt.Printf("    %s\n", diagnostic)
+		}
+	}
+	overlayState := "missing/stale"
+	if status.Overlay.Fresh {
+		overlayState = "fresh"
+	}
+	fmt.Printf("  overlay: %s\n", overlayState)
+	for _, scope := range manifest.Scopes {
+		if count, verified := status.Overlay.HTTPUnresolvedByScope[scope.ID]; verified {
+			fmt.Printf("    %s: %d unresolved HTTP call(s)\n", scope.ID, count)
+		}
+	}
+	return 0
+}
+
+type workspaceQueryArgs struct {
+	Start           string
+	Scope           string
+	IncludePossible bool
+	BuildTags       []string
+	Positional      []string
+}
+
+func parseWorkspaceQueryArgs(args []string) (workspaceQueryArgs, error) {
+	parsed := workspaceQueryArgs{Start: "."}
+	seenScope, seenWorkspace, seenIncludePossible := false, false, false
+	for index := 0; index < len(args); index++ {
+		handled, consumedThrough, tagsErr := parseBuildTagsOption(args, index, &parsed.BuildTags)
+		if tagsErr != nil {
+			return parsed, tagsErr
+		}
+		if handled {
+			index = consumedThrough
+			continue
+		}
+		switch args[index] {
+		case "--scope":
+			if seenScope {
+				return parsed, fmt.Errorf("--scope may be specified only once")
+			}
+			seenScope = true
+			if index+1 >= len(args) {
+				return parsed, fmt.Errorf("--scope requires a value")
+			}
+			index++
+			parsed.Scope = args[index]
+		case "--workspace":
+			if seenWorkspace {
+				return parsed, fmt.Errorf("--workspace may be specified only once")
+			}
+			seenWorkspace = true
+			if index+1 >= len(args) {
+				return parsed, fmt.Errorf("--workspace requires a value")
+			}
+			index++
+			parsed.Start = args[index]
+		case "--include-possible":
+			if seenIncludePossible {
+				return parsed, fmt.Errorf("--include-possible may be specified only once")
+			}
+			seenIncludePossible = true
+			parsed.IncludePossible = true
+		default:
+			if strings.HasPrefix(args[index], "-") {
+				return parsed, fmt.Errorf("unknown argument: %s", args[index])
+			}
+			parsed.Positional = append(parsed.Positional, args[index])
+		}
+	}
+	var err error
+	parsed.BuildTags, err = buildctx.NormalizeBuildTags(parsed.BuildTags)
+	if err != nil {
+		return parsed, fmt.Errorf("invalid --tags: %w", err)
+	}
+	return parsed, nil
+}
+
+func loadWorkspaceQuery(parsed workspaceQueryArgs) (*workspacegraph.LoadedWorkspace, workspacegraph.ScopeOverlay, error) {
+	loaded, err := workspacegraph.LoadWithBuildTags(context.Background(), parsed.Start, parsed.BuildTags)
+	if err != nil {
+		return nil, workspacegraph.ScopeOverlay{}, err
+	}
+	scope, err := workspacegraph.SelectScope(loaded, parsed.Scope)
+	return loaded, scope, err
+}
+
+func runWorkspaceQuery(args []string) int {
+	parsed, err := parseWorkspaceQueryArgs(args)
+	if err == nil && parsed.IncludePossible {
+		err = fmt.Errorf("--include-possible applies only to workspace path and impact")
+	}
+	if err != nil || len(parsed.Positional) == 0 {
+		if err == nil {
+			err = fmt.Errorf("usage: gograph workspace query [--scope id] [--tags=integration] <term...>")
+		}
+		return failCommand("workspace query", err.Error())
+	}
+	term := strings.Join(parsed.Positional, " ")
+	if strings.TrimSpace(term) == "" {
+		return failCommand("workspace query", "query term must not be empty")
+	}
+	loaded, scope, err := loadWorkspaceQuery(parsed)
+	if err != nil {
+		return failCommand("workspace query", err.Error())
+	}
+	response := workspacegraph.Query(loaded, scope, term)
+	if jsonMode {
+		return PrintJSON(okEnvelope("workspace query", term, response, len(response.Results)+len(response.HTTPUnresolved)))
+	}
+	for _, unresolved := range response.HTTPUnresolved {
+		fmt.Printf("unresolved HTTP: %s %s — %s (%s:%s:%d)\n", unresolved.Method, unresolved.URL, unresolved.Reason, unresolved.Source.RepositoryID, unresolved.File, unresolved.Line)
+	}
+	for _, result := range response.Results {
+		fmt.Printf("%s", workspaceDisplayNode(result.Node))
+		if result.File != "" {
+			fmt.Printf(" (%s:%d)", result.File, result.Line)
+		}
+		fmt.Println()
+	}
+	return 0
+}
+
+func runWorkspacePath(args []string) int {
+	parsed, err := parseWorkspaceQueryArgs(args)
+	if err != nil || len(parsed.Positional) != 2 {
+		if err == nil {
+			err = fmt.Errorf("usage: gograph workspace path [--scope id] [--tags=integration] [--include-possible] <from> <to>")
+		}
+		return failCommand("workspace path", err.Error())
+	}
+	loaded, scope, err := loadWorkspaceQuery(parsed)
+	if err != nil {
+		return failCommand("workspace path", err.Error())
+	}
+	response, err := workspacegraph.Path(loaded, scope, parsed.Positional[0], parsed.Positional[1], parsed.IncludePossible)
+	if err != nil {
+		return failCommand("workspace path", err.Error())
+	}
+	if jsonMode {
+		count := len(response.Steps)
+		return PrintJSON(okEnvelope("workspace path", strings.Join(parsed.Positional, " -> "), response, count))
+	}
+	if !response.Found {
+		fmt.Println("No workspace path found.")
+		return 0
+	}
+	for _, step := range response.Steps {
+		fmt.Printf("%s --%s--> %s\n", workspaceDisplayNode(step.From), step.Kind, workspaceDisplayNode(step.To))
+	}
+	return 0
+}
+
+func runWorkspaceImpact(args []string) int {
+	parsed, err := parseWorkspaceQueryArgs(args)
+	if err != nil || len(parsed.Positional) != 1 {
+		if err == nil {
+			err = fmt.Errorf("usage: gograph workspace impact [--scope id] [--tags=integration] [--include-possible] <target>")
+		}
+		return failCommand("workspace impact", err.Error())
+	}
+	loaded, scope, err := loadWorkspaceQuery(parsed)
+	if err != nil {
+		return failCommand("workspace impact", err.Error())
+	}
+	response, err := workspacegraph.Impact(loaded, scope, parsed.Positional[0], parsed.IncludePossible)
+	if err != nil {
+		return failCommand("workspace impact", err.Error())
+	}
+	if jsonMode {
+		return PrintJSON(okEnvelope("workspace impact", parsed.Positional[0], response, len(response.Affected)))
+	}
+	for _, result := range response.Affected {
+		fmt.Println(workspaceDisplayNode(result.Node))
+	}
+	return 0
+}
+
+func workspaceDisplayNode(node workspacegraph.NodeRef) string {
+	if node.RepositoryID == "" {
+		return node.Kind + ":" + node.NodeID
+	}
+	return node.RepositoryID + ":" + node.NodeID
+}
+
+func runWorkspaceMCP(args []string) int {
+	start, buildTags, err := parseWorkspaceStartAndTags(args, "workspace mcp")
+	if err != nil {
+		return failCommand("workspace mcp", err.Error())
+	}
+	root, err := workspacegraph.FindRoot(start)
+	if err != nil {
+		return failCommand("workspace mcp", err.Error())
+	}
+	if _, _, err := workspacegraph.LoadManifest(root); err != nil {
+		return failCommand("workspace mcp", err.Error())
+	}
+	if err := mcp.ServeWorkspaceWithBuildTags(root, Version, buildTags); err != nil {
+		return failCommand("workspace mcp", err.Error())
+	}
+	return 0
+}
+
+func parseWorkspaceStartAndTags(args []string, command string) (string, []string, error) {
+	start := "."
+	startSet := false
+	var buildTags []string
+	for index := 0; index < len(args); index++ {
+		handled, consumedThrough, err := parseBuildTagsOption(args, index, &buildTags)
+		if err != nil {
+			return "", nil, err
+		}
+		if handled {
+			index = consumedThrough
+			continue
+		}
+		if strings.HasPrefix(args[index], "-") {
+			return "", nil, fmt.Errorf("unknown argument: %s", args[index])
+		}
+		if startSet {
+			return "", nil, fmt.Errorf("usage: gograph %s [path] [--tags=integration]", command)
+		}
+		start, startSet = args[index], true
+	}
+	normalized, err := buildctx.NormalizeBuildTags(buildTags)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid --tags: %w", err)
+	}
+	return start, normalized, nil
+}

@@ -1,0 +1,874 @@
+package cli_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/ozgurcd/gograph/internal/cli"
+	"github.com/ozgurcd/gograph/internal/graph"
+)
+
+func captureTestOutput(t *testing.T, run func()) (stdout, stderr string) {
+	t.Helper()
+
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	outReader, outWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errReader, errWriter, err := os.Pipe()
+	if err != nil {
+		_ = outReader.Close()
+		_ = outWriter.Close()
+		t.Fatal(err)
+	}
+	os.Stdout, os.Stderr = outWriter, errWriter
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	outResult := make(chan readResult, 1)
+	errResult := make(chan readResult, 1)
+	go func() {
+		data, readErr := io.ReadAll(outReader)
+		outResult <- readResult{data: data, err: readErr}
+	}()
+	go func() {
+		data, readErr := io.ReadAll(errReader)
+		errResult <- readResult{data: data, err: readErr}
+	}()
+
+	func() {
+		defer func() {
+			os.Stdout, os.Stderr = oldStdout, oldStderr
+		}()
+		run()
+		_ = outWriter.Close()
+		_ = errWriter.Close()
+	}()
+
+	out := <-outResult
+	errOut := <-errResult
+	_ = outReader.Close()
+	_ = errReader.Close()
+	if out.err != nil {
+		t.Fatal(out.err)
+	}
+	if errOut.err != nil {
+		t.Fatal(errOut.err)
+	}
+	return string(out.data), string(errOut.data)
+}
+
+func TestBuildGraph(t *testing.T) {
+	// Create a temporary directory with a dummy Go file
+	tmpDir := t.TempDir()
+	dummyGo := filepath.Join(tmpDir, "main.go")
+	content := `package main
+import "fmt"
+func main() {
+	fmt.Println("Hello")
+}
+`
+	if err := os.WriteFile(dummyGo, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create dummy file: %v", err)
+	}
+
+	g, err := cli.BuildGraph(tmpDir)
+	if err != nil {
+		t.Fatalf("BuildGraph failed: %v", err)
+	}
+
+	if g == nil {
+		t.Fatal("expected non-nil graph")
+	}
+	if g.Root != tmpDir {
+		t.Errorf("expected root %s, got %s", tmpDir, g.Root)
+	}
+	if len(g.Packages) == 0 {
+		t.Fatal("expected at least one package")
+	}
+	if len(g.Files) == 0 {
+		t.Fatal("expected at least one file")
+	}
+	if g.Files[0].PackageName != "main" {
+		t.Errorf("expected package main, got %s", g.Files[0].PackageName)
+	}
+
+	// Check if the call was captured
+	foundCall := false
+	for _, call := range g.Calls {
+		if call.CalleeRaw == "fmt.Println" {
+			foundCall = true
+		}
+	}
+	if !foundCall {
+		t.Error("expected to find fmt.Println call in the graph")
+	}
+}
+
+func TestBuildGraphRejectsAllParseFailures(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "broken.go"), []byte("package broken\nfunc {\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var g *graph.Graph
+	var err error
+	_, stderr := captureTestOutput(t, func() {
+		g, err = cli.BuildGraph(root)
+	})
+	if err == nil {
+		t.Fatalf("expected all-parse-failures error, got graph %+v", g)
+	}
+	if !strings.Contains(err.Error(), "none of 1 Go files parsed successfully") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(stderr, "expected 'IDENT', found '{'") {
+		t.Fatalf("missing parse diagnostic: %q", stderr)
+	}
+}
+
+func TestBuildGraphReportsPartialParseFailures(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "valid.go"), []byte("package sample\nfunc Valid() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "broken.go"), []byte("package sample\nfunc {\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var g *graph.Graph
+	var err error
+	_, stderr := captureTestOutput(t, func() {
+		g, err = cli.BuildGraph(root)
+	})
+	if err != nil {
+		t.Fatalf("BuildGraph: %v", err)
+	}
+	if g.Build == nil || g.Build.Complete || g.Build.ScannedFiles != 2 || g.Build.ParsedFiles != 1 || len(g.Build.Failures) != 1 {
+		t.Fatalf("unexpected build metadata: %+v", g.Build)
+	}
+	if !strings.Contains(stderr, "expected 'IDENT', found '{'") {
+		t.Fatalf("missing parse diagnostic: %q", stderr)
+	}
+}
+
+func TestBuildGraphFiltersNonCallableArgumentsAndDedupesCallbacks(t *testing.T) {
+	root := t.TempDir()
+	source := `package sample
+
+import (
+	"fmt"
+	"os"
+)
+
+type handler struct{}
+
+func callback() {}
+func (h *handler) serve() {}
+func register(...any) {}
+
+func run(h *handler, err error, g any, root string) {
+	fmt.Fprintf(os.Stderr, "%v", err)
+	register(callback)
+	register(h.serve)
+	register(g)
+	register(root)
+}
+`
+	if err := os.WriteFile(filepath.Join(root, "sample.go"), []byte(source), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	g, err := cli.BuildGraph(root)
+	if err != nil {
+		t.Fatalf("BuildGraph: %v", err)
+	}
+
+	forbidden := map[string]bool{
+		"err":       true,
+		"g":         true,
+		"root":      true,
+		"os.Stderr": true,
+	}
+	seen := make(map[string]int)
+	for _, call := range g.Calls {
+		if forbidden[call.CalleeRaw] {
+			t.Errorf("ordinary argument %q was emitted as a call", call.CalleeRaw)
+		}
+		key := fmt.Sprintf("%s|%s|%s|%d|%s", call.CallerSymbolID, call.CalleeRaw, call.File, call.Line, call.CalleeSymbolID)
+		seen[key]++
+		if seen[key] > 1 {
+			t.Errorf("duplicate call edge %s", key)
+		}
+	}
+
+	for _, want := range []string{"fmt.Fprintf", "register", "callback", "h.serve"} {
+		found := false
+		for _, call := range g.Calls {
+			if call.CalleeRaw == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected call edge %q, got %+v", want, g.Calls)
+		}
+	}
+}
+
+func TestBuildCommandRejectsDirectoryWithoutGoFiles(t *testing.T) {
+	binPath := buildTestBinary(t)
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/empty\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	emptyGraphDir := filepath.Join(root, ".gograph")
+	if err := os.MkdirAll(emptyGraphDir, 0o755); err != nil {
+		t.Fatalf("mkdir empty .gograph dir: %v", err)
+	}
+
+	cmd := exec.Command(binPath, "build", "--precise", ".")
+	cmd.Dir = emptyGraphDir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("expected build to fail for directory without Go files, got success:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "no Go files") {
+		t.Fatalf("expected no-Go-files error, got:\n%s", out.String())
+	}
+
+	nestedOutputDir := filepath.Join(emptyGraphDir, ".gograph")
+	if _, err := os.Stat(nestedOutputDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected no nested output dir at %s, stat err: %v", nestedOutputDir, err)
+	}
+	if _, err := os.Stat(filepath.Join(emptyGraphDir, ".gitignore")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected no .gitignore side effect, stat err: %v", err)
+	}
+}
+
+func TestBuildCommandWritesGitignoreAtRepositoryRoot(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	binPath := buildTestBinary(t)
+
+	root := t.TempDir()
+	initGit := exec.Command("git", "init")
+	initGit.Dir = root
+	if out, err := initGit.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/root\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatalf("write root go.mod: %v", err)
+	}
+
+	nested := filepath.Join(root, "e2e")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested module: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "go.mod"), []byte("module example.com/e2e\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatalf("write nested go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write nested main.go: %v", err)
+	}
+
+	cmd := exec.Command(binPath, "build", nested)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build nested module: %v\n%s", err, out)
+	}
+
+	rootGitignore, err := os.ReadFile(filepath.Join(root, ".gitignore"))
+	if err != nil {
+		t.Fatalf("read root .gitignore: %v", err)
+	}
+	if !strings.Contains(string(rootGitignore), ".gograph/") {
+		t.Fatalf("expected root .gitignore to contain .gograph/, got:\n%s", rootGitignore)
+	}
+	checkIgnore := exec.Command("git", "check-ignore", "--quiet", filepath.Join(nested, ".gograph", "graph.json"))
+	checkIgnore.Dir = root
+	if out, err := checkIgnore.CombinedOutput(); err != nil {
+		t.Fatalf("expected root .gitignore to ignore nested graph output: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(nested, ".gitignore")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected no nested .gitignore, stat err: %v", err)
+	}
+}
+
+// TestAllCommandsRegistered parses the Run() switch statement in cli.go via
+// go/ast and asserts every canonical CLI command has a registered case.
+// This prevents the class of bug where a command is documented but never wired.
+func TestAllCommandsRegistered(t *testing.T) {
+	// Canonical list: every user-facing command that must be in the Run() switch.
+	// Maintenance rule: when you add a command to help/capabilities, add it here too.
+	want := []string{
+		"build",
+		"workspace",
+		"validate",
+		"doctor",
+		"query",
+		"explore",
+		"focus",
+		"node",
+		"source",
+		"public",
+		"fields",
+		"embeds",
+		"imports",
+		"callers",
+		"callees",
+		"impact",
+		"implementers",
+		"interfaces",
+		"path",
+		"stale",
+		"stats",
+		"orphans",
+		"godobj",
+		"complexity",
+		"diagram",
+		"coupling",
+		"context",
+		"hotspot",
+		"httpcalls",
+		"deps",
+		"dependents",
+		"changes",
+		"capabilities",
+		"mcp",
+		"routes",
+		"sql",
+		"errors",
+		"envs",
+		"concurrency",
+		"tests",
+		"coverage",
+		"identity",
+		"constructors",
+		"literals",
+		"usages",
+		"returnusage",
+		"schema",
+		"globals",
+		"mocks",
+		"trace",
+		"arity",
+		"mutate",
+		"skeleton",
+		"api",
+		"contract",
+		"errorflow",
+		"flow",
+		"fixtures",
+		"plan",
+		"review",
+		"risk",
+		"boundaries",
+		"endpoint",
+		"explain",
+		"gate",
+		"snapshot",
+		"check",
+		"add-claude-plugin",
+		"hook-guard",
+		"--json",
+		"--files-only",
+		"--mermaid",
+		"session",
+		"--session",
+		"wiki",
+		"summary",
+		"untested",
+		"doc",
+		"-i",
+		"--intention",
+		"--session-id",
+		// aliases
+		"help",
+		"--help",
+		"-h",
+		"version",
+		"--version",
+		"-v",
+	}
+
+	// Locate cli.go relative to this test file.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	cliPath := filepath.Join(filepath.Dir(thisFile), "cli.go")
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, cliPath, nil, 0)
+	if err != nil {
+		t.Fatalf("failed to parse cli.go: %v", err)
+	}
+
+	// Walk the AST and collect all case clause string literals inside Run() and dispatch().
+	registered := make(map[string]bool)
+	ast.Inspect(f, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok {
+			return true
+		}
+		if fn.Name.Name != "Run" && fn.Name.Name != "dispatch" {
+			return true
+		}
+		// Found Run or dispatch — now collect all CaseClause string values within it.
+		ast.Inspect(fn.Body, func(inner ast.Node) bool {
+			cc, ok := inner.(*ast.CaseClause)
+			if !ok {
+				return true
+			}
+			for _, expr := range cc.List {
+				if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					// Strip surrounding quotes.
+					val := lit.Value[1 : len(lit.Value)-1]
+					registered[val] = true
+				}
+			}
+			return true
+		})
+		return false
+	})
+
+	sort.Strings(want)
+	var missing []string
+	for _, cmd := range want {
+		if !registered[cmd] {
+			missing = append(missing, cmd)
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("the following commands are documented but NOT registered in Run():\n  %v\nAdd a case for each in the Run() switch in cli.go.", missing)
+	}
+
+	// Inverse check: warn about cases in Run() not in the canonical list.
+	wantSet := make(map[string]bool, len(want))
+	for _, w := range want {
+		wantSet[w] = true
+	}
+	var extra []string
+	for cmd := range registered {
+		if !wantSet[cmd] {
+			extra = append(extra, cmd)
+		}
+	}
+	if len(extra) > 0 {
+		sort.Strings(extra)
+		t.Errorf("the following cases exist in Run() but are NOT in the canonical want list in this test:\n  %v\nAdd them to the want slice above.", extra)
+	}
+}
+
+func TestStaleExitCodes(t *testing.T) {
+	root, bin := setupGraphFixture(t)
+
+	cmd := exec.Command(bin, "stale")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gograph stale (up to date): %v\n%s", err, out)
+	}
+
+	mainGo := filepath.Join(root, "main.go")
+	if err := os.WriteFile(mainGo, []byte("package main\nfunc main() { println(1) }\n"), 0o644); err != nil {
+		t.Fatalf("change main.go: %v", err)
+	}
+
+	cmd = exec.Command(bin, "stale")
+	cmd.Dir = root
+	out, err = cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("gograph stale (stale graph): expected exit 2, got %v\n%s", err, out)
+	}
+	cmd = exec.Command(bin, "stale", "--json")
+	cmd.Dir = root
+	out, err = cmd.CombinedOutput()
+	exitErr = nil
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("gograph stale --json (stale graph): expected exit 2, got %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "\"schema_version\"") || !strings.Contains(string(out), "\"command\": \"stale\"") {
+		t.Fatalf("gograph stale --json: expected JSON output, got:\n%s", out)
+	}
+
+	noGraphDir := t.TempDir()
+	cmd = exec.Command(bin, "stale")
+	cmd.Dir = noGraphDir
+	out, err = cmd.CombinedOutput()
+	exitErr = nil
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("gograph stale (missing graph): expected exit 1, got %v\n%s", err, out)
+	}
+}
+
+func TestStaleExitCodeIsSuccessfulSessionTelemetry(t *testing.T) {
+	root, bin := setupGraphFixture(t)
+
+	cmd := exec.Command(bin, "session", "create", "staleexit")
+	cmd.Dir = root
+	createOut, createErr := cmd.CombinedOutput()
+	if createErr != nil {
+		t.Fatalf("create session: %v\n%s", createErr, createOut)
+	}
+	t.Setenv("GOGRAPH_SESSION", strings.Split(string(createOut), "\"")[1])
+
+	mainGo := filepath.Join(root, "main.go")
+	if err := os.WriteFile(mainGo, []byte("package main\nfunc main() { println(1) }\n"), 0o644); err != nil {
+		t.Fatalf("change main.go: %v", err)
+	}
+
+	cmd = exec.Command(bin, "stale")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("gograph stale: expected exit 2, got %v\n%s", err, out)
+	}
+
+	cmd = exec.Command(bin, "session", "end")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("end session: %v\n%s", err, out)
+	}
+
+	cmd = exec.Command(bin, "--json", "session", "audit")
+	cmd.Dir = root
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("audit session: %v\n%s", err, out)
+	}
+	var report struct {
+		TotalCommands int     `json:"total_commands"`
+		SuccessCount  int     `json:"success_count"`
+		FailureCount  int     `json:"failure_count"`
+		SuccessRate   float64 `json:"success_rate"`
+	}
+	if err := json.Unmarshal(out, &report); err != nil {
+		t.Fatalf("decode session audit: %v\n%s", err, out)
+	}
+	if report.TotalCommands != 1 || report.SuccessCount != 1 || report.FailureCount != 0 || report.SuccessRate != 100 {
+		t.Fatalf("unexpected stale telemetry audit: %+v", report)
+	}
+}
+
+func TestHelpDocumentsEveryCanonicalCommand(t *testing.T) {
+	cmd := exec.Command(buildTestBinary(t), "--help")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gograph --help: %v\n%s", err, out)
+	}
+	documented := make(map[string]bool)
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "  ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		name := strings.TrimSuffix(fields[0], ",")
+		documented[name] = true
+	}
+	want := []string{
+		"build", "stale", "stats", "explore", "query", "focus", "node", "source", "public",
+		"fields", "embeds", "imports", "mutate", "arity", "skeleton", "callers",
+		"callees", "impact", "path", "trace", "orphans", "implementers", "interfaces",
+		"constructors", "literals", "returnusage", "usages", "schema", "globals", "mocks",
+		"fixtures", "check", "gate", "snapshot", "boundaries", "complexity", "diagram",
+		"coupling", "context", "explain", "hotspot", "summary", "untested", "endpoint",
+		"deps", "dependents", "changes", "godobj", "plan", "review", "risk", "api",
+		"routes", "sql", "httpcalls", "errorflow", "flow", "errors", "envs", "concurrency", "tests",
+		"capabilities", "wiki", "doc", "mcp", "session", "add-claude-plugin", "hook-guard",
+		"version", "validate", "doctor", "help", "workspace",
+	}
+	for _, name := range want {
+		if !documented[name] {
+			t.Errorf("gograph --help does not document %q", name)
+		}
+	}
+}
+
+func TestHelpDocumentsBoundariesConfigDefault(t *testing.T) {
+	binary := buildTestBinary(t)
+	cmd := exec.Command(binary, "--help")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gograph --help: %v\n%s", err, out)
+	}
+	help := string(out)
+	for _, want := range []string{"boundaries [--config PATH]", ".gograph/boundaries.json", "boundaries --create [--config PATH]"} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("gograph --help does not contain %q", want)
+		}
+	}
+
+	cmd = exec.Command(binary, "boundaries", "--help")
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gograph boundaries --help: %v\n%s", err, out)
+	}
+	commandHelp := string(out)
+	wantUsage := "USAGE\n  gograph boundaries [--config PATH]\n\nDESCRIPTION\n  Verify package architecture constraints."
+	if !strings.Contains(commandHelp, wantUsage) {
+		t.Fatalf("gograph boundaries --help has a malformed usage/description split:\n%s", commandHelp)
+	}
+}
+
+func TestHelpDocumentsImplementedModes(t *testing.T) {
+	cmd := exec.Command(buildTestBinary(t), "--help")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gograph --help: %v\n%s", err, out)
+	}
+
+	help := string(out)
+	for _, mode := range []string{
+		"callers <function> [--no-tests] [--depth N] [--exact]",
+		"coupling [package] [--include-stdlib] [--internal-only]",
+		"context <symbol> [--limit N] [--exact]",
+		"explore <term...> [--compact|--deep] [--limit N] [--exact]",
+		"--compact defaults to 5",
+		"--deep defaults to 25",
+		"hotspot [--top N] [--include-tests]",
+		"plan <symbol> [--with-context]",
+		"plan --uncommitted [--with-context]",
+		"routes [term] [--module MODULE] [--include-tests] [--limit N] [--cursor CURSOR]",
+		"Production routes",
+		"gograph_capabilities reports the running server version",
+		"sql [term]",
+		"--table TABLE] [--verb VERB] [--access read|write|ddl]",
+		"Deterministic gograph.sql.v1 pages of static PostgreSQL",
+		"--no-tests excludes",
+		"Repeat --table, --verb, or --access",
+		"total/returned/truncated/next_cursor",
+		"flow [term] [--source kind] [--sink kind] [--config path] [--no-tests]",
+		"Sources: http_request, decoded_json, environment.",
+		"Sinks: sql_query, process_execution, filesystem, outbound_http.",
+		"Tests are included by default; --no-tests excludes them.",
+		"workspace build [path] [--refresh-members] [--tags=<tag[,tag...]>] [--memory-mode=low]",
+		"build [path] [--precise] [--strict] [--tags=<tag[,tag...]>] [--exclude-dirs=<dir1,dir2>] [--memory-mode=low] [--max-memory=<size>]",
+		"--strict requires --precise",
+		"mcp [path] [--persist-refresh] [--tags=<tag[,tag...]>] [--exclude-dirs=<dir1,dir2>] [--memory-mode=low] [--max-memory=<size>]",
+		"--tags selects a comma-separated tagged build context",
+		"soft Go runtime memory target",
+		"workspace path [--scope id] [--workspace path] [--tags=<tag[,tag...]>] [--include-possible] <from> <to>",
+		"Best ranked call chain between two symbols",
+		"gograph_workspace_status",
+		"CLI --json and MCP JSON have identical native values",
+		"CLI / MCP TRANSPORT COVERAGE",
+		"64 CLI-equivalent capabilities + 4 session tools",
+		"coverage <test> [--exact-only]",
+		"tests [symbol] [--transitive] [--exact-only] [--package name]",
+		"identity <symbol-or-stable-id>",
+		"untested [--pkg name] [--top N] [--exclude glob]... [--wide]",
+		"build, validate, doctor, gate, snapshot",
+		"typed_partial",
+		"--transitive requires",
+		"Artifacts over 512 MiB are rejected before allocation",
+		"without dependency-body call graphs",
+		"current repository graph's",
+		"Obsolete generator-owned package pages are removed",
+	} {
+		if !strings.Contains(help, mode) {
+			t.Errorf("gograph --help does not document implemented mode %q", mode)
+		}
+	}
+}
+
+func TestWorkspaceHelpIncludesManifestSchemaAndMissingManifestGuidance(t *testing.T) {
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "workspace", "--help")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gograph workspace --help: %v\n%s", err, output)
+	}
+	for _, want := range []string{
+		"gograph workspace <build|status|query|path|impact|mcp>",
+		"schema_version: gograph.workspace-manifest.v1",
+		"default_scope: oss",
+		"scopes:",
+		"repositories: [api, client]",
+		"http_clients:",
+		"base: env:API_URL",
+		"authority_id: api-service",
+		"path_prefix: /v1",
+		"http_unresolved",
+		"docs/workspaces.md",
+		"https://gograph.identuum.ai/docs/command-reference/#federated-workspaces",
+	} {
+		if !strings.Contains(string(output), want) {
+			t.Errorf("workspace help omits %q\n%s", want, output)
+		}
+	}
+
+	missingRoot := t.TempDir()
+	command = exec.Command(binary, "workspace", "status", ".")
+	command.Dir = missingRoot
+	output, err = command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("workspace status without manifest unexpectedly succeeded\n%s", output)
+	}
+	if !strings.Contains(string(output), "gograph workspace --help") || !strings.Contains(string(output), ".gograph-workspace.yml") {
+		t.Fatalf("missing-manifest diagnostic lacks schema guidance\n%s", output)
+	}
+}
+
+func TestCapabilitiesDocumentsImplementedModes(t *testing.T) {
+	cmd := exec.Command(buildTestBinary(t), "capabilities")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gograph capabilities: %v\n%s", err, out)
+	}
+
+	capabilities := string(out)
+	for _, want := range []string{
+		"llm-wiki/index.md",
+		"llm-wiki/agent-rules.md",
+		"build . --precise  then  review --uncommitted",
+		"callers <fn> [--no-tests] [--depth N] [--exact]",
+		"coupling [pkg] [--include-stdlib] [--internal-only]",
+		"explore <term...> [--compact|--deep] [--limit N] [--exact]",
+		"compact defaults to 5",
+		"deep defaults to 25",
+		"Question-like",
+		"selection_basis",
+		"context <sym> [--limit N] [--exact]",
+		"hotspot [--top N] [--include-tests]",
+		"plan <sym> [--with-context]",
+		"plan --uncommitted [--with-context]",
+		"sql [term]",
+		"--table T] [--verb V] [--access read|write|ddl] [--function F]",
+		"bounded gograph.sql.v1 PostgreSQL static SQL census",
+		"statically resolvable local or same-file package const/var declarations",
+		"Receiver.Method and stable IDs",
+		"AST-discovered test-file fakes",
+		"composite Foo{...} construction",
+		"not a complete route-row dump",
+		".gograph/boundaries.json by default",
+		"remain included unless --no-tests is set",
+		"total/returned/truncated/next_cursor",
+		"flow [term] [--source kind] [--sink kind] [--config path] [--no-tests]",
+		"source: http_request | decoded_json | environment",
+		"sink: sql_query | process_execution | filesystem | outbound_http",
+		"tests are included by default; sanitizer policy is evaluated at query time",
+		"MCP refreshes stay in memory by default",
+		"--persist-refresh",
+		"not a branch cache",
+		"does not edit .gitignore",
+		"last trusted persisted graph",
+		"missing or unsupported source-policy marker",
+		"source-confinement contract",
+		"type/variable/constant",
+		"UNKNOWN/-1",
+		"Filesystem-shaped queries are rejected",
+		"━━━ FEDERATED WORKSPACES",
+		"gograph workspace build --refresh-members [--tags=integration]",
+		"gograph build . --precise --memory-mode=low --max-memory=1GiB",
+		"gograph build . --precise --strict",
+		"gograph mcp [path] --persist-refresh [--tags=integration] [--memory-mode=low] [--max-memory=1GiB]",
+		"Unrelated regular-file or dangling links",
+		"non-Go extensions",
+		"nearest real Git checkout",
+		"different GOWORK/build context",
+		"freshness, analysis mode/capabilities, and build-context diagnostic",
+		"obsolete generator-owned packages/*.md pages",
+		"soft Go runtime memory target",
+		"analysis_build_context",
+		"gograph_workspace_status",
+		"gograph_workspace_query",
+		"gograph_workspace_path",
+		"gograph_workspace_impact",
+		"MCP JSON text is exactly the CLI results object",
+		"Repository and workspace path queries rank competing routes",
+		"fewer cross-repository transitions",
+		"━━━ CLI / MCP TRANSPORT COVERAGE",
+		"64 CLI-equivalent capabilities plus four session lifecycle tools",
+		"coverage <test> [--exact-only]",
+		"tests <sym> --transitive",
+		"identity <sym>",
+		"--exclude <glob>",
+		"--wide",
+		"build, validate, doctor, gate, snapshot",
+		"ambiguous/possible evidence",
+		"Workspace changes are not part",
+		"disables member-configured fsmonitor hooks",
+		"doctor --json",
+		"test_resolution=possible",
+		"typed_partial",
+		"Static attribution is not runtime coverage",
+		"reject artifacts larger than 512 MiB before allocation",
+		"not dependency bodies",
+	} {
+		if !strings.Contains(capabilities, want) {
+			t.Errorf("gograph capabilities does not document implemented mode %q", want)
+		}
+	}
+	for _, stale := range []string{"llm-wiki/README.md", "llm-wiki/rules.md", "since last build"} {
+		if strings.Contains(capabilities, stale) {
+			t.Errorf("gograph capabilities retains stale guidance %q", stale)
+		}
+	}
+}
+
+func TestWorkspaceDocumentationSurfacesDescribeCLIAndMCPParity(t *testing.T) {
+	for path, required := range map[string][]string{
+		"../../README.md": {
+			"Federated Workspaces",
+			"four read-only workspace MCP tools return the same native result values as CLI `--json`",
+		},
+		"../../RELEASE_NOTES.md": {
+			"Workspace status, query, path, and impact have one CLI/MCP result contract",
+		},
+		"../../docs/workspaces.md": {
+			"CLI and MCP use the same native result contracts",
+			"gograph_workspace_status",
+			"--include-possible",
+		},
+		"../../docs-site/content/docs/command-reference.md": {
+			"## Federated Workspaces",
+			"the MCP JSON text is exactly the native value",
+			"gograph_workspace_impact",
+		},
+		"../../llm-wiki/workspace-v1.md": {
+			"## CLI and MCP parity",
+			"Workspace build, member refresh, overlay publication, and workspace-server startup remain CLI-only lifecycle operations",
+		},
+	} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read documentation %s: %v", path, err)
+		}
+		for _, want := range required {
+			if !strings.Contains(string(content), want) {
+				t.Errorf("%s does not document %q", path, want)
+			}
+		}
+	}
+}

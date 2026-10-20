@@ -1,0 +1,2216 @@
+// Package parser extracts graph nodes from a single Go source file using the
+// standard go/ast and go/parser packages. No code from the target repository
+// is executed.
+package parser
+
+import (
+	"bytes"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"maps"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"github.com/ozgurcd/gograph/internal/graph"
+	"github.com/ozgurcd/gograph/internal/sqlquery"
+)
+
+// FileResult holds everything extracted from one source file.
+type FileResult struct {
+	File          graph.FileNode
+	Symbols       []graph.SymbolNode
+	Imports       []graph.ImportEdge
+	Calls         []graph.CallEdge
+	Env           []graph.EnvRead
+	Routes        []graph.HTTPRoute
+	SQLs          []graph.SQLEdge
+	Errors        []graph.ErrorEdge
+	Concurrency   []graph.ConcurrencyNode
+	TestEdges     []graph.TestEdge
+	Mutations     []graph.MutationEdge
+	Literals      []graph.LiteralEdge
+	HTTPCalls     []graph.HTTPCallEdge
+	FlowFunctions []graph.FlowFunction
+}
+
+// ParseFile parses a single .go file and extracts its nodes.
+// path must be an absolute or repo-relative path.
+// relPath is the repo-relative file path, stored in File nodes and graph edges.
+// pkgImportPath is the module-rooted import path of the package (e.g. "github.com/org/repo/internal/auth").
+// It is used as the stable prefix for symbol IDs so that IDs survive file renames within a package.
+func ParseFile(fset *token.FileSet, path, relPath, pkgImportPath string) (*FileResult, error) {
+	return parseSource(fset, path, nil, relPath, pkgImportPath)
+}
+
+// ParseSource parses one Go source file from caller-supplied bytes. When src is
+// nil, it retains ParseFile's historical direct-path behavior for internal
+// callers and tests. Repository builds pass confined bytes so go/parser never
+// reopens a graph-derived filesystem path.
+func ParseSource(fset *token.FileSet, path string, src []byte, relPath, pkgImportPath string) (*FileResult, error) {
+	return parseSource(fset, path, src, relPath, pkgImportPath)
+}
+
+func parseSource(fset *token.FileSet, path string, src any, relPath, pkgImportPath string) (*FileResult, error) {
+	f, err := parser.ParseFile(fset, path, src, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	tf := fset.File(f.Pos())
+	lineCount := 0
+	if tf != nil {
+		lineCount = tf.LineCount()
+	}
+
+	pkgName := f.Name.Name
+
+	result := &FileResult{
+		File: graph.FileNode{
+			ID:          relPath,
+			Path:        relPath,
+			PackageName: pkgName,
+			Lines:       lineCount,
+		},
+	}
+	resolver := newFileResolver(f)
+	packageValues := make(map[string]bool)
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || (gen.Tok != token.VAR && gen.Tok != token.CONST) {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			if values, ok := spec.(*ast.ValueSpec); ok {
+				for _, name := range values.Names {
+					packageValues[name.Name] = true
+				}
+			}
+		}
+	}
+	result.FlowFunctions = append(result.FlowFunctions, extractFlowLiterals(fset, f, relPath, pkgImportPath, resolver)...)
+
+	// Imports.
+	for _, imp := range f.Imports {
+		importPath := strings.Trim(imp.Path.Value, `"`)
+		alias := ""
+		if imp.Name != nil {
+			alias = imp.Name.Name
+		}
+		result.Imports = append(result.Imports, graph.ImportEdge{
+			FromFile:    relPath,
+			FromPackage: pkgName,
+			ImportPath:  importPath,
+			Alias:       alias,
+		})
+	}
+
+	// Top-level declarations.
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.GenDecl:
+			extractGenDecl(fset, d, relPath, pkgName, pkgImportPath, result)
+		case *ast.FuncDecl:
+			extractFuncDecl(fset, d, relPath, pkgName, pkgImportPath, result, resolver, packageValues)
+		}
+	}
+
+	// Extract HTTP Routes
+	routePrefixes := resolveRoutePrefixes(f)
+	echoRouters := resolveEchoRouters(f)
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		method := routeMethod(selector.Sel.Name)
+		receiverVerified := supportedRouteReceiver(f, selector.X, make(map[ast.Node]bool))
+		receiverUnresolved := !receiverVerified && supportedRouteReceiver(f, selector.X, make(map[ast.Node]bool), true)
+		if method != "" && len(call.Args) >= 1 {
+			routePath, resolved := routeString(call.Args[0])
+			if !resolved {
+				routePath = "<unresolved path>"
+			}
+			if method == "Handle" || method == "HandleFunc" {
+				if verb, pattern, ok := strings.Cut(routePath, " "); ok && resolved {
+					method, routePath = verb, pattern
+				}
+			}
+			path := joinRoutePath(routePrefixForExpr(selector.X, routePrefixes), routePath)
+			handler := ""
+			inlineBody := ""
+			handlerAppended := false
+			if len(call.Args) >= 2 {
+				// Gin and Fiber put the terminal handler after variadic
+				// middleware. Echo puts the handler immediately after the path
+				// and appends middleware after it, so retain the framework origin
+				// while choosing the candidate instead of applying one argument
+				// order to every router API.
+				handlerArg := routeHandlerArg(call, selector.X, echoRouters)
+				switch h := handlerArg.(type) {
+				case *ast.FuncLit:
+					// Inline anonymous function — not a named symbol.
+					// Record a descriptive label so callers know it is a closure
+					// and can navigate to the exact line in the source file.
+					handler = fmt.Sprintf("<inline handler at line %d>", fset.Position(h.Pos()).Line)
+					// Render the full function literal source via go/printer so it
+					// can be served from graph.json without re-reading the source file.
+					var buf bytes.Buffer
+					if err := printer.Fprint(&buf, fset, h); err == nil {
+						inlineBody = buf.String()
+					}
+				case *ast.CallExpr:
+					// Factory / curried / middleware-wrapped handler patterns:
+					//   router.POST("/path", HandleBulkCreateUsers(jobSvc, auditSvc))
+					//   mux.HandleFunc("/path", guard(h.method))
+					//   mux.HandleFunc("/path", wrap1(wrap2(h.method)))
+					//
+					// Prefer the *inner* handler reference (the method value or
+					// function the wrapper will eventually invoke) over the outer
+					// wrapper's name. The orphan-reachability BFS in
+					// search.ReachableOrphans seeds entry-point roots from
+					// HTTPRoute.Handler; if we record the wrapper name here, the
+					// real handler (e.g. (*AdminHandler).customers) appears
+					// unreachable because the BFS never reaches it through the
+					// opaque wrapper closure.
+					//
+					// Fall back to the outer call's name only when no inner
+					// callable reference can be recovered (e.g. the handler is
+					// itself the call's *result*, not an argument — the factory
+					// pattern above). In that case DynamicHandler is set so
+					// agents know the handler symbol can't be statically resolved.
+					if inner := extractHandlerRefs(h); len(inner) > 0 {
+						handler = inner[0]
+					} else {
+						handler = calleeString(h)
+						result.Routes = append(result.Routes, graph.HTTPRoute{
+							UnresolvedPath:     !resolved,
+							ReceiverVerified:   receiverVerified,
+							ReceiverUnresolved: receiverUnresolved,
+							Column:             fset.Position(call.Pos()).Column,
+							Method:             method,
+							Path:               path,
+							Handler:            handler,
+							DynamicHandler:     true,
+							File:               relPath,
+							Line:               fset.Position(call.Pos()).Line,
+						})
+						handlerAppended = true
+					}
+				default:
+					handler = typeString(handlerArg)
+				}
+			}
+			if !handlerAppended {
+				result.Routes = append(result.Routes, graph.HTTPRoute{
+					UnresolvedPath:     !resolved,
+					ReceiverVerified:   receiverVerified,
+					ReceiverUnresolved: receiverUnresolved,
+					Column:             fset.Position(call.Pos()).Column,
+					Method:             method,
+					Path:               path,
+					Handler:            handler,
+					InlineBody:         inlineBody,
+					File:               relPath,
+					Line:               fset.Position(call.Pos()).Line,
+				})
+			}
+		}
+		return true
+	})
+
+	return result, nil
+}
+
+// resolveRoutePrefixes derives constant route-group prefixes from common
+// Gin, Echo, Fiber, and Chi registration shapes. Objects, rather than names,
+// key the environment so shadowed router variables do not contaminate one
+// another. A small fixed-point pass handles declarations and nested Route
+// closures regardless of traversal order.
+type echoRouterResolution struct {
+	objects   map[any]bool
+	aliases   map[string]bool
+	dotImport bool
+}
+
+func routeHandlerArg(call *ast.CallExpr, receiver ast.Expr, echoRouters echoRouterResolution) ast.Expr {
+	if isEchoRouterExpr(receiver, echoRouters) {
+		return call.Args[1]
+	}
+	return call.Args[len(call.Args)-1]
+}
+
+// resolveEchoRouters records the lexical objects that are provably Echo router
+// values. Echo's route-registration order is path, handler, middleware..., the
+// inverse of the Gin/Fiber convention this parser otherwise uses for variadic
+// registrations. The resolver deliberately requires an Echo import and a
+// structural type/constructor/group relationship; names such as "echo" alone
+// are not treated as evidence.
+func resolveEchoRouters(file *ast.File) echoRouterResolution {
+	aliases, dotImport := echoImportAliases(file)
+	resolution := echoRouterResolution{
+		objects:   make(map[any]bool),
+		aliases:   aliases,
+		dotImport: dotImport,
+	}
+	if len(aliases) == 0 && !dotImport {
+		return resolution
+	}
+
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch value := node.(type) {
+		case *ast.Field:
+			if !isEchoRouterType(value.Type, aliases, dotImport) {
+				return true
+			}
+			for _, name := range value.Names {
+				if name.Obj != nil {
+					resolution.objects[name.Obj] = true
+				}
+			}
+		case *ast.ValueSpec:
+			if value.Type == nil || !isEchoRouterType(value.Type, aliases, dotImport) {
+				return true
+			}
+			for _, name := range value.Names {
+				if name.Obj != nil {
+					resolution.objects[name.Obj] = true
+				}
+			}
+		}
+		return true
+	})
+
+	for changed := true; changed; {
+		changed = false
+		ast.Inspect(file, func(node ast.Node) bool {
+			assign := func(names []*ast.Ident, values []ast.Expr) {
+				for index, name := range names {
+					if name.Obj == nil || index >= len(values) || resolution.objects[name.Obj] {
+						continue
+					}
+					if isEchoRouterExpr(values[index], resolution) {
+						resolution.objects[name.Obj] = true
+						changed = true
+					}
+				}
+			}
+
+			switch value := node.(type) {
+			case *ast.AssignStmt:
+				for index, lhs := range value.Lhs {
+					name, ok := lhs.(*ast.Ident)
+					if !ok || index >= len(value.Rhs) {
+						continue
+					}
+					assign([]*ast.Ident{name}, []ast.Expr{value.Rhs[index]})
+				}
+			case *ast.ValueSpec:
+				assign(value.Names, value.Values)
+			}
+			return true
+		})
+	}
+
+	return resolution
+}
+
+func echoImportAliases(file *ast.File) (map[string]bool, bool) {
+	aliases := make(map[string]bool)
+	dotImport := false
+	for _, imp := range file.Imports {
+		importPath := strings.Trim(imp.Path.Value, `"`)
+		if importPath != "github.com/labstack/echo" && importPath != "github.com/labstack/echo/v4" {
+			continue
+		}
+		if imp.Name == nil {
+			aliases["echo"] = true
+			continue
+		}
+		switch imp.Name.Name {
+		case ".":
+			dotImport = true
+		case "_":
+		default:
+			aliases[imp.Name.Name] = true
+		}
+	}
+	return aliases, dotImport
+}
+
+func isEchoRouterType(expr ast.Expr, aliases map[string]bool, dotImport bool) bool {
+	if pointer, ok := expr.(*ast.StarExpr); ok {
+		return isEchoRouterType(pointer.X, aliases, dotImport)
+	}
+	switch value := expr.(type) {
+	case *ast.SelectorExpr:
+		alias, ok := value.X.(*ast.Ident)
+		return ok && alias.Obj == nil && aliases[alias.Name] && (value.Sel.Name == "Echo" || value.Sel.Name == "Group")
+	case *ast.Ident:
+		return dotImport && value.Obj == nil && (value.Name == "Echo" || value.Name == "Group")
+	}
+	return false
+}
+
+func isEchoRouterExpr(expr ast.Expr, resolution echoRouterResolution) bool {
+	switch value := expr.(type) {
+	case *ast.Ident:
+		if value.Obj != nil && resolution.objects[value.Obj] {
+			return true
+		}
+		return resolution.dotImport && value.Obj == nil && value.Name == "New"
+	case *ast.ParenExpr:
+		return isEchoRouterExpr(value.X, resolution)
+	case *ast.CallExpr:
+		if constructor, ok := value.Fun.(*ast.Ident); ok {
+			return resolution.dotImport && constructor.Obj == nil && constructor.Name == "New"
+		}
+		selector, ok := value.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		if selector.Sel.Name == "New" {
+			alias, ok := selector.X.(*ast.Ident)
+			return ok && alias.Obj == nil && resolution.aliases[alias.Name]
+		}
+		return selector.Sel.Name == "Group" && isEchoRouterExpr(selector.X, resolution)
+	}
+	return false
+}
+
+func resolveRoutePrefixes(file *ast.File) map[any]string {
+	prefixes := make(map[any]string)
+	for changed := true; changed; {
+		changed = false
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch value := node.(type) {
+			case *ast.AssignStmt:
+				for index, lhs := range value.Lhs {
+					if index >= len(value.Rhs) {
+						break
+					}
+					ident, ok := lhs.(*ast.Ident)
+					if !ok || ident.Obj == nil {
+						continue
+					}
+					if prefix, ok := groupedRoutePrefix(value.Rhs[index], prefixes); ok && prefixes[ident.Obj] != prefix {
+						prefixes[ident.Obj] = prefix
+						changed = true
+					}
+				}
+			case *ast.ValueSpec:
+				for index, ident := range value.Names {
+					if ident.Obj == nil || index >= len(value.Values) {
+						continue
+					}
+					if prefix, ok := groupedRoutePrefix(value.Values[index], prefixes); ok && prefixes[ident.Obj] != prefix {
+						prefixes[ident.Obj] = prefix
+						changed = true
+					}
+				}
+			case *ast.CallExpr:
+				selector, ok := value.Fun.(*ast.SelectorExpr)
+				if !ok || selector.Sel.Name != "Route" || len(value.Args) < 2 {
+					break
+				}
+				path, ok := routeString(value.Args[0])
+				closure, closureOK := value.Args[1].(*ast.FuncLit)
+				if !ok || !closureOK || closure.Type.Params == nil || len(closure.Type.Params.List) == 0 || len(closure.Type.Params.List[0].Names) == 0 {
+					break
+				}
+				parameter := closure.Type.Params.List[0].Names[0]
+				if parameter.Obj == nil {
+					break
+				}
+				prefix := joinRoutePath(routePrefixForExpr(selector.X, prefixes), path)
+				if prefixes[parameter.Obj] != prefix {
+					prefixes[parameter.Obj] = prefix
+					changed = true
+				}
+			}
+			return true
+		})
+	}
+	return prefixes
+}
+
+func groupedRoutePrefix(expr ast.Expr, prefixes map[any]string) (string, bool) {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return "", false
+	}
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Group" || len(call.Args) == 0 {
+		return "", false
+	}
+	path, ok := routeString(call.Args[0])
+	if !ok {
+		return "", false
+	}
+	return joinRoutePath(routePrefixForExpr(selector.X, prefixes), path), true
+}
+
+func routePrefixForExpr(expr ast.Expr, prefixes map[any]string) string {
+	switch value := expr.(type) {
+	case *ast.Ident:
+		return prefixes[value.Obj]
+	case *ast.CallExpr:
+		selector, ok := value.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return ""
+		}
+		base := routePrefixForExpr(selector.X, prefixes)
+		if selector.Sel.Name == "Group" && len(value.Args) > 0 {
+			if path, ok := routeString(value.Args[0]); ok {
+				return joinRoutePath(base, path)
+			}
+		}
+		// Chi's With and similar fluent middleware calls preserve the router's
+		// current mount point.
+		return base
+	case *ast.ParenExpr:
+		return routePrefixForExpr(value.X, prefixes)
+	}
+	return ""
+}
+
+func routeMethod(name string) string {
+	switch name {
+	case "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD":
+		return name
+	case "Get", "Post", "Put", "Delete", "Patch", "Options", "Head":
+		return strings.ToUpper(name)
+	case "Any", "Handle", "HandleFunc":
+		return name
+	default:
+		return ""
+	}
+}
+
+func routeString(expr ast.Expr) (string, bool) {
+	return routeConstantString(expr, make(map[ast.Expr]bool))
+}
+
+func routeConstantString(expr ast.Expr, seen map[ast.Expr]bool) (string, bool) {
+	if expr == nil || seen[expr] {
+		return "", false
+	}
+	seen[expr] = true
+	defer delete(seen, expr)
+	switch value := expr.(type) {
+	case *ast.ParenExpr:
+		return routeConstantString(value.X, seen)
+	case *ast.BinaryExpr:
+		if value.Op != token.ADD {
+			return "", false
+		}
+		a, aOK := routeConstantString(value.X, seen)
+		b, bOK := routeConstantString(value.Y, seen)
+		return a + b, aOK && bOK
+	case *ast.Ident:
+		if value.Obj != nil && value.Obj.Kind == ast.Con {
+			if spec, ok := value.Obj.Decl.(*ast.ValueSpec); ok {
+				for i, name := range spec.Names {
+					if name.Name == value.Name && i < len(spec.Values) {
+						return routeConstantString(spec.Values[i], seen)
+					}
+				}
+			}
+		}
+	}
+	literal, ok := expr.(*ast.BasicLit)
+	if !ok || literal.Kind != token.STRING {
+		return "", false
+	}
+	value, err := strconv.Unquote(literal.Value)
+	if err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func joinRoutePath(prefix, suffix string) string {
+	if prefix == "" {
+		return suffix
+	}
+	if suffix == "" {
+		return prefix
+	}
+	return strings.TrimSuffix(prefix, "/") + "/" + strings.TrimPrefix(suffix, "/")
+}
+
+type syncPrimitive string
+
+const (
+	syncMutex     syncPrimitive = "mutex"
+	syncRWMutex   syncPrimitive = "rwmutex"
+	syncWaitGroup syncPrimitive = "waitgroup"
+	syncOnce      syncPrimitive = "once"
+)
+
+type fileResolver struct {
+	imports        map[string]string
+	dotImports     map[string]bool
+	packageVars    map[string]syncPrimitive
+	fields         map[string]syncPrimitive
+	fieldConflicts map[string]bool
+	structFields   map[string]map[string]syncPrimitive
+}
+
+type functionResolver struct {
+	file           *fileResolver
+	variables      map[string]syncPrimitive
+	receiverName   string
+	receiverFields map[string]syncPrimitive
+}
+
+func newFileResolver(file *ast.File) *fileResolver {
+	r := &fileResolver{
+		imports:        make(map[string]string),
+		dotImports:     make(map[string]bool),
+		packageVars:    make(map[string]syncPrimitive),
+		fields:         make(map[string]syncPrimitive),
+		fieldConflicts: make(map[string]bool),
+		structFields:   make(map[string]map[string]syncPrimitive),
+	}
+	for _, imp := range file.Imports {
+		path := strings.Trim(imp.Path.Value, `"`)
+		name := path
+		if idx := strings.LastIndex(path, "/"); idx >= 0 {
+			name = path[idx+1:]
+		}
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		if name == "." {
+			r.dotImports[path] = true
+		} else if name != "_" {
+			r.imports[name] = path
+		}
+	}
+
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			st, ok := typeSpec.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+			fields := make(map[string]syncPrimitive)
+			for _, field := range st.Fields.List {
+				kind, isSyncField := r.primitiveType(field.Type)
+				for _, name := range field.Names {
+					if !isSyncField {
+						delete(r.fields, name.Name)
+						r.fieldConflicts[name.Name] = true
+						continue
+					}
+					fields[name.Name] = kind
+					if r.fieldConflicts[name.Name] {
+						continue
+					}
+					if previous, exists := r.fields[name.Name]; !exists || previous == kind {
+						r.fields[name.Name] = kind
+					} else {
+						delete(r.fields, name.Name)
+						r.fieldConflicts[name.Name] = true
+					}
+				}
+			}
+			r.structFields[typeSpec.Name.Name] = fields
+		}
+	}
+
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			if valueSpec, ok := spec.(*ast.ValueSpec); ok {
+				r.collectValueSpec(r.packageVars, valueSpec)
+			}
+		}
+	}
+	return r
+}
+
+func (r *fileResolver) primitiveType(expr ast.Expr) (syncPrimitive, bool) {
+	switch value := expr.(type) {
+	case *ast.StarExpr:
+		return r.primitiveType(value.X)
+	case *ast.ParenExpr:
+		return r.primitiveType(value.X)
+	case *ast.SelectorExpr:
+		pkg, ok := value.X.(*ast.Ident)
+		if !ok || pkg.Obj != nil || r.imports[pkg.Name] != "sync" {
+			return "", false
+		}
+		return primitiveName(value.Sel.Name)
+	case *ast.Ident:
+		if r.dotImports["sync"] && value.Obj == nil {
+			return primitiveName(value.Name)
+		}
+	}
+	return "", false
+}
+
+func primitiveName(name string) (syncPrimitive, bool) {
+	switch name {
+	case "Mutex":
+		return syncMutex, true
+	case "RWMutex":
+		return syncRWMutex, true
+	case "WaitGroup":
+		return syncWaitGroup, true
+	case "Once":
+		return syncOnce, true
+	default:
+		return "", false
+	}
+}
+
+func (r *fileResolver) collectValueSpec(dst map[string]syncPrimitive, spec *ast.ValueSpec) {
+	if kind, ok := r.primitiveType(spec.Type); ok {
+		for _, name := range spec.Names {
+			dst[name.Name] = kind
+		}
+		return
+	}
+	if spec.Type != nil {
+		for _, name := range spec.Names {
+			delete(dst, name.Name)
+		}
+		return
+	}
+	for i, name := range spec.Names {
+		if i < len(spec.Values) {
+			if kind, ok := r.primitiveValue(spec.Values[i], dst); ok {
+				dst[name.Name] = kind
+			} else {
+				delete(dst, name.Name)
+			}
+		}
+	}
+}
+
+func (r *fileResolver) primitiveValue(expr ast.Expr, variables map[string]syncPrimitive) (syncPrimitive, bool) {
+	switch value := expr.(type) {
+	case *ast.CompositeLit:
+		return r.primitiveType(value.Type)
+	case *ast.UnaryExpr:
+		return r.primitiveValue(value.X, variables)
+	case *ast.ParenExpr:
+		return r.primitiveValue(value.X, variables)
+	case *ast.Ident:
+		kind, ok := variables[value.Name]
+		return kind, ok
+	case *ast.CallExpr:
+		if id, ok := value.Fun.(*ast.Ident); ok && id.Name == "new" && len(value.Args) == 1 {
+			return r.primitiveType(value.Args[0])
+		}
+	}
+	return "", false
+}
+
+func (r *fileResolver) forFunction(decl *ast.FuncDecl) *functionResolver {
+	fr := &functionResolver{file: r, variables: make(map[string]syncPrimitive)}
+	maps.Copy(fr.variables, r.packageVars)
+	collectFields := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			kind, ok := r.primitiveType(field.Type)
+			for _, name := range field.Names {
+				if ok {
+					fr.variables[name.Name] = kind
+				} else {
+					delete(fr.variables, name.Name)
+				}
+			}
+		}
+	}
+	collectFields(decl.Type.Params)
+	collectFields(decl.Type.Results)
+	if decl.Recv != nil && len(decl.Recv.List) > 0 {
+		receiver := decl.Recv.List[0]
+		if len(receiver.Names) > 0 {
+			fr.receiverName = receiver.Names[0].Name
+		}
+		typeName := strings.TrimPrefix(receiverString(receiver.Type), "*")
+		fr.receiverFields = r.structFields[typeName]
+	}
+	if decl.Body != nil {
+		ast.Inspect(decl.Body, func(node ast.Node) bool {
+			switch value := node.(type) {
+			case *ast.FuncLit:
+				return false
+			case *ast.DeclStmt:
+				if gen, ok := value.Decl.(*ast.GenDecl); ok && gen.Tok == token.VAR {
+					for _, spec := range gen.Specs {
+						if valueSpec, ok := spec.(*ast.ValueSpec); ok {
+							r.collectValueSpec(fr.variables, valueSpec)
+						}
+					}
+				}
+			case *ast.AssignStmt:
+				if value.Tok == token.DEFINE {
+					for i, lhs := range value.Lhs {
+						id, ok := lhs.(*ast.Ident)
+						if !ok || i >= len(value.Rhs) {
+							continue
+						}
+						if kind, ok := r.primitiveValue(value.Rhs[i], fr.variables); ok {
+							fr.variables[id.Name] = kind
+						} else {
+							delete(fr.variables, id.Name)
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+	return fr
+}
+
+func (r *functionResolver) receiverPrimitive(expr ast.Expr) (syncPrimitive, bool) {
+	switch value := expr.(type) {
+	case *ast.Ident:
+		kind, ok := r.variables[value.Name]
+		return kind, ok
+	case *ast.SelectorExpr:
+		if base, ok := value.X.(*ast.Ident); ok && base.Name == r.receiverName {
+			kind, found := r.receiverFields[value.Sel.Name]
+			return kind, found
+		}
+		kind, ok := r.file.fields[value.Sel.Name]
+		return kind, ok
+	case *ast.ParenExpr:
+		return r.receiverPrimitive(value.X)
+	case *ast.StarExpr:
+		return r.receiverPrimitive(value.X)
+	}
+	return "", false
+}
+
+func (r *functionResolver) concurrencyKind(call *ast.CallExpr) (string, bool) {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	primitive, ok := r.receiverPrimitive(selector.X)
+	if !ok {
+		return "", false
+	}
+	switch primitive {
+	case syncMutex:
+		switch selector.Sel.Name {
+		case "Lock":
+			return "mutex_lock", true
+		case "Unlock":
+			return "mutex_unlock", true
+		}
+	case syncRWMutex:
+		switch selector.Sel.Name {
+		case "Lock", "RLock":
+			return "rwmutex_lock", true
+		case "Unlock", "RUnlock":
+			return "rwmutex_unlock", true
+		}
+	case syncWaitGroup:
+		switch selector.Sel.Name {
+		case "Add":
+			return "waitgroup_add", true
+		case "Wait":
+			return "waitgroup_wait", true
+		}
+	case syncOnce:
+		if selector.Sel.Name == "Do" {
+			return "once_do", true
+		}
+	}
+	return "", false
+}
+
+func (r *fileResolver) isErrorConstructor(call *ast.CallExpr) bool {
+	if id, ok := call.Fun.(*ast.Ident); ok {
+		return id.Obj == nil && (id.Name == "panic" || (id.Name == "New" && r.dotImports["errors"]))
+	}
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	if !ok || pkg.Obj != nil {
+		return false
+	}
+	switch r.imports[pkg.Name] {
+	case "fmt":
+		return selector.Sel.Name == "Errorf"
+	case "errors":
+		return selector.Sel.Name == "New"
+	default:
+		return false
+	}
+}
+
+// extractGenDecl handles type declarations (structs, interfaces).
+func extractGenDecl(fset *token.FileSet, d *ast.GenDecl, relPath, pkgName, pkgImportPath string, result *FileResult) {
+	for _, spec := range d.Specs {
+		if vs, ok := spec.(*ast.ValueSpec); ok {
+			if d.Tok == token.VAR || d.Tok == token.CONST {
+				for _, name := range vs.Names {
+					pos := fset.Position(name.Pos())
+					endPos := fset.Position(vs.End()) // use vs.End() to capture the entire expression block
+					doc := ""
+					if d.Doc != nil {
+						doc = d.Doc.Text()
+					} else if vs.Comment != nil {
+						doc = vs.Comment.Text()
+					}
+
+					symKind := graph.KindVar
+					if d.Tok == token.CONST {
+						symKind = graph.KindConst
+					}
+
+					sym := graph.SymbolNode{
+						DeclarationDigest: declarationDigest(fset, vs),
+						ID:                fmt.Sprintf("%s::%s", pkgImportPath, name.Name),
+						Kind:              symKind,
+						Name:              name.Name,
+						PackageName:       pkgName,
+						File:              relPath,
+						Line:              pos.Line,
+						EndLine:           endPos.Line,
+						Doc:               strings.TrimSpace(doc),
+					}
+					if d.Tok == token.CONST {
+						// iota and omitted expressions depend on the enclosing group.
+						sym.DeclarationDigest = declarationDigest(fset, d)
+					}
+					result.Symbols = append(result.Symbols, sym)
+				}
+				// Walk package-level initializer expressions for call edges.
+				// `var x = compute()` and `var y = registry{handler: h.method}`
+				// both run at package load time (alongside init() functions);
+				// any functions they invoke or function values they capture
+				// are live, but without these edges the reachability BFS in
+				// search.ReachableOrphans never reaches them. Attribute the
+				// edges to a synthetic "init" caller — that name is seeded as
+				// a root in advanced.go so the chain is reached from a real
+				// entry point.
+				for _, v := range vs.Values {
+					// Pass A: direct call expressions in the initializer.
+					ast.Inspect(v, func(n ast.Node) bool {
+						call, ok := n.(*ast.CallExpr)
+						if !ok {
+							return true
+						}
+						callee := calleeString(call)
+						// go/ssa reports call instruction positions at the opening
+						// parenthesis. Store the same coordinate so precise enrichment
+						// can join an SSA call back to this exact AST expression.
+						callPos := fset.Position(call.Lparen)
+						if callee != "" {
+							result.Calls = append(result.Calls, graph.CallEdge{
+								CallerName: "init",
+								CalleeRaw:  callee,
+								File:       relPath,
+								Line:       callPos.Line,
+								Column:     callPos.Column,
+							})
+						}
+						// Same function-value-as-arg handling as in function
+						// bodies (Bug 1) — initializers can also pass method
+						// values to constructors / registry calls.
+						for _, ref := range extractCallableRefs(call) {
+							result.Calls = append(result.Calls, graph.CallEdge{
+								CallerName: "init",
+								CalleeRaw:  ref,
+								File:       relPath,
+								Line:       callPos.Line,
+								Column:     callPos.Column,
+								Potential:  true,
+							})
+						}
+						return true
+					})
+					// Pass B: function values captured by the initializer
+					// expression directly (struct/map literals carrying
+					// function fields, e.g. `var x = Config{OnEvent: foo}`,
+					// or bare-Ident handlers like `var defaultHandler = foo`).
+					var refs []string
+					collectFuncRefs(v, &refs)
+					for _, ref := range refs {
+						result.Calls = append(result.Calls, graph.CallEdge{
+							CallerName: "init",
+							CalleeRaw:  ref,
+							File:       relPath,
+							Line:       fset.Position(v.Pos()).Line,
+							Column:     fset.Position(v.Pos()).Column,
+							Potential:  true,
+						})
+					}
+				}
+			}
+			continue
+		}
+
+		ts, ok := spec.(*ast.TypeSpec)
+		if !ok {
+			continue
+		}
+		var kind graph.SymbolKind
+		var methods map[string]string
+		var fields []graph.StructField
+		var embeds []string
+		switch t := ts.Type.(type) {
+		case *ast.StructType:
+			kind = graph.KindStruct
+			if t.Fields != nil {
+				for _, f := range t.Fields.List {
+					typeStr := typeString(f.Type)
+					tagStr := ""
+					if f.Tag != nil {
+						tagStr = f.Tag.Value
+					}
+					if len(f.Names) == 0 {
+						embeds = append(embeds, typeStr)
+						fields = append(fields, graph.StructField{Name: typeStr, Type: typeStr, Tag: tagStr})
+					} else {
+						for _, n := range f.Names {
+							fields = append(fields, graph.StructField{Name: n.Name, Type: typeStr, Tag: tagStr})
+						}
+					}
+				}
+			}
+		case *ast.InterfaceType:
+			kind = graph.KindInterface
+			if t.Methods != nil {
+				methods = make(map[string]string)
+				for _, m := range t.Methods.List {
+					if len(m.Names) > 0 {
+						if ft, ok := m.Type.(*ast.FuncType); ok {
+							sig := funcTypeSignature(ft)
+							methods[m.Names[0].Name] = sig
+						}
+					}
+				}
+			}
+		default:
+			// Type aliases (type Foo = Bar) and named types whose underlying
+			// type isn't a struct or interface (type StatusCode int, type
+			// HandlerFunc func(...) error, etc.) are all valid Go declarations
+			// that should appear as queryable symbols. Without this, `query
+			// JSONMap` returns nothing for `type JSONMap = map[string]any`
+			// and exported aliases vanish from `gograph public`. Record them
+			// as type symbols with the best-effort underlying type string in
+			// the Doc-adjacent slot via typeString().
+			kind = graph.KindType
+		}
+
+		pos := fset.Position(ts.Pos())
+		endPos := fset.Position(ts.End())
+		doc := ""
+		if d.Doc != nil {
+			doc = d.Doc.Text()
+		} else if ts.Comment != nil {
+			doc = ts.Comment.Text()
+		}
+
+		sym := graph.SymbolNode{
+			DeclarationDigest:        declarationDigest(fset, ts),
+			ID:                       fmt.Sprintf("%s::%s", pkgImportPath, ts.Name.Name),
+			Kind:                     kind,
+			Name:                     ts.Name.Name,
+			PackageName:              pkgName,
+			File:                     relPath,
+			Line:                     pos.Line,
+			EndLine:                  endPos.Line,
+			Doc:                      strings.TrimSpace(doc),
+			InterfaceMethods:         cloneStringMap(methods),
+			DeclaredInterfaceMethods: cloneStringMap(methods),
+			StructFields:             fields,
+			EmbeddedStructs:          embeds,
+		}
+		result.Symbols = append(result.Symbols, sym)
+	}
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+	clone := make(map[string]string, len(source))
+	maps.Copy(clone, source)
+	return clone
+}
+
+func mutationTypeName(expr ast.Expr) string {
+	switch value := expr.(type) {
+	case *ast.Ident:
+		return value.Name
+	case *ast.SelectorExpr:
+		prefix := mutationTypeName(value.X)
+		if prefix == "" {
+			return value.Sel.Name
+		}
+		return prefix + "." + value.Sel.Name
+	case *ast.StarExpr:
+		return mutationTypeName(value.X)
+	case *ast.ParenExpr:
+		return mutationTypeName(value.X)
+	case *ast.IndexExpr:
+		return mutationTypeName(value.X)
+	case *ast.IndexListExpr:
+		return mutationTypeName(value.X)
+	default:
+		return ""
+	}
+}
+
+func mutationValueName(expr ast.Expr) string {
+	switch value := expr.(type) {
+	case *ast.Ident:
+		return value.Name
+	case *ast.StarExpr:
+		return mutationValueName(value.X)
+	case *ast.ParenExpr:
+		return mutationValueName(value.X)
+	default:
+		return ""
+	}
+}
+
+func inferredMutationType(expr ast.Expr) string {
+	switch value := expr.(type) {
+	case *ast.CompositeLit:
+		return mutationTypeName(value.Type)
+	case *ast.UnaryExpr:
+		return inferredMutationType(value.X)
+	case *ast.ParenExpr:
+		return inferredMutationType(value.X)
+	default:
+		return ""
+	}
+}
+
+func mutationValueTypes(d *ast.FuncDecl) map[string]string {
+	typesByName := make(map[string]string)
+	addFields := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			typeName := mutationTypeName(field.Type)
+			for _, name := range field.Names {
+				typesByName[name.Name] = typeName
+			}
+		}
+	}
+	addFields(d.Recv)
+	addFields(d.Type.Params)
+	ast.Inspect(d.Body, func(node ast.Node) bool {
+		switch value := node.(type) {
+		case *ast.ValueSpec:
+			typeName := mutationTypeName(value.Type)
+			for _, name := range value.Names {
+				if typeName != "" {
+					typesByName[name.Name] = typeName
+				}
+			}
+		case *ast.AssignStmt:
+			if value.Tok != token.DEFINE || len(value.Lhs) != len(value.Rhs) {
+				return true
+			}
+			for i, lhs := range value.Lhs {
+				name, ok := lhs.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if typeName := inferredMutationType(value.Rhs[i]); typeName != "" {
+					typesByName[name.Name] = typeName
+				}
+			}
+		}
+		return true
+	})
+	return typesByName
+}
+
+// extractFuncDecl handles function and method declarations.
+func extractFuncDecl(fset *token.FileSet, d *ast.FuncDecl, relPath, pkgName, pkgImportPath string, result *FileResult, resolver *fileResolver, packageValues map[string]bool) {
+	pos := fset.Position(d.Pos())
+	endPos := fset.Position(d.End())
+
+	receiver := ""
+	kind := graph.KindFunction
+	if d.Recv != nil && len(d.Recv.List) > 0 {
+		kind = graph.KindMethod
+		receiver = receiverString(d.Recv.List[0].Type)
+	}
+
+	doc := ""
+	if d.Doc != nil {
+		doc = d.Doc.Text()
+	}
+
+	sig := funcSignature(d)
+	methodSig := ""
+	arity := 0
+	if d.Type != nil {
+		methodSig = funcTypeSignature(d.Type)
+		if d.Type.Params != nil {
+			for _, field := range d.Type.Params.List {
+				if len(field.Names) > 0 {
+					arity += len(field.Names)
+				} else {
+					arity += 1
+				}
+			}
+		}
+	}
+	id := fmt.Sprintf("%s::%s", pkgImportPath, d.Name.Name)
+	if receiver != "" {
+		id = fmt.Sprintf("%s::(%s).%s", pkgImportPath, receiver, d.Name.Name)
+	}
+
+	sym := graph.SymbolNode{
+		DeclarationDigest: declarationDigest(fset, d),
+		ID:                id,
+		Kind:              kind,
+		Name:              d.Name.Name,
+		Receiver:          receiver,
+		PackageName:       pkgName,
+		File:              relPath,
+		Line:              pos.Line,
+		EndLine:           endPos.Line,
+		Doc:               strings.TrimSpace(doc),
+		Signature:         sig,
+		MethodSignature:   methodSig,
+		Arity:             arity,
+	}
+	result.Symbols = append(result.Symbols, sym)
+
+	// Extract call edges, env reads, concurrency, and test edges from the body.
+	if d.Body != nil {
+		functionResolver := resolver.forFunction(d)
+		result.FlowFunctions = append(result.FlowFunctions, extractFlowFunction(fset, d, relPath, sym, resolver))
+		mutationTypes := mutationValueTypes(d)
+		callerName := d.Name.Name
+		if receiver != "" {
+			callerName = fmt.Sprintf("(%s).%s", receiver, d.Name.Name)
+		}
+		isTestFunc := strings.HasPrefix(d.Name.Name, "Test") || strings.HasPrefix(d.Name.Name, "Benchmark")
+		contextNames := functionContextNames(d)
+
+		// Concurrency: inspect go statements and channel sends.
+		ast.Inspect(d.Body, func(n ast.Node) bool {
+			switch stmt := n.(type) {
+			case *ast.GoStmt:
+				detail := calleeString(stmt.Call)
+				result.Concurrency = append(result.Concurrency, graph.ConcurrencyNode{
+					Kind:     "goroutine",
+					Function: callerName,
+					File:     relPath,
+					Line:     fset.Position(stmt.Pos()).Line,
+					Detail:   "go " + detail,
+				})
+			case *ast.SendStmt:
+				result.Concurrency = append(result.Concurrency, graph.ConcurrencyNode{
+					Kind:     "channel_send",
+					Function: callerName,
+					File:     relPath,
+					Line:     fset.Position(stmt.Pos()).Line,
+					Detail:   exprName(stmt.Chan) + " <-",
+				})
+			}
+			return true
+		})
+
+		returnUsageMap := buildReturnUsageMap(d.Body)
+
+		ast.Inspect(d.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			// go/ssa reports call instruction positions at the opening
+			// parenthesis. Store the same coordinate so precise enrichment
+			// can join an SSA call back to this exact AST expression.
+			callPos := fset.Position(call.Lparen)
+			callee := calleeString(call)
+
+			if kind, ok := functionResolver.concurrencyKind(call); ok {
+				result.Concurrency = append(result.Concurrency, graph.ConcurrencyNode{
+					Kind:     kind,
+					Function: callerName,
+					File:     relPath,
+					Line:     callPos.Line,
+					Detail:   callee,
+				})
+			}
+
+			// Env-var detection.
+			if ev, ok := envRead(call, callee, callPos.Line, relPath, callerName); ok {
+				result.Env = append(result.Env, ev)
+			}
+
+			// SQL Extraction
+			if callee != "" {
+				parts := strings.Split(callee, ".")
+				method := parts[len(parts)-1]
+				isSQLMethod := method == "Query" || method == "QueryRow" || method == "Exec" || method == "QueryContext" || method == "QueryRowContext" || method == "ExecContext" || method == "Raw"
+
+				if isSQLMethod && len(call.Args) > 0 {
+					var queryStr string
+					queryIndex := 0
+					if strings.HasSuffix(method, "Context") || len(call.Args) > 1 && isContextArgument(call.Args[0], contextNames) {
+						queryIndex = 1
+					}
+					var found bool
+					if queryIndex < len(call.Args) {
+						queryStr, found = resolveStaticStringLiteral(d.Body, call.Args[queryIndex], call.Pos())
+					}
+
+					if found {
+						classification := sqlquery.ClassifyPostgreSQL(queryStr)
+						if classification.Verb != "" {
+							tables := make([]graph.SQLTableRef, 0, len(classification.Tables))
+							for _, table := range classification.Tables {
+								tables = append(tables, graph.SQLTableRef{Name: table.Name, Access: table.Access})
+							}
+							result.SQLs = append(result.SQLs, graph.SQLEdge{
+								Query:          queryStr,
+								Function:       callerName,
+								File:           relPath,
+								Line:           callPos.Line,
+								Verb:           classification.Verb,
+								Access:         classification.Access,
+								Classification: classification.Status,
+								Tables:         tables,
+							})
+						}
+					}
+				}
+			}
+
+			// Error/Panic Extraction
+			if resolver.isErrorConstructor(call) {
+				for _, arg := range call.Args {
+					if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						result.Errors = append(result.Errors, graph.ErrorEdge{
+							Message:  strings.Trim(lit.Value, "\""),
+							Function: callerName,
+							File:     relPath,
+							Line:     callPos.Line,
+						})
+						break
+					}
+				}
+			}
+
+			// HTTP Client Call Extraction (including possible request construction).
+			if method, urlIndex, requestOnly, ok := httpClientCall(resolver, d.Body, call); ok {
+				fact := extractHTTPURL(d.Body, call.Args[urlIndex], call.Pos(), resolver)
+				fact.SourceFile, fact.SourceLine = relPath, callPos.Line
+				fact.FunctionName, fact.Method, fact.RequestOnly = callerName, method, requestOnly
+				result.HTTPCalls = append(result.HTTPCalls, fact)
+			}
+			// Test edge: record which production symbols a test calls.
+			if isTestFunc && callee != "" && !strings.HasPrefix(callee, "t.") && !strings.HasPrefix(callee, "b.") {
+				result.TestEdges = append(result.TestEdges, graph.TestEdge{
+					TestFunc: d.Name.Name,
+					Target:   callee,
+					File:     relPath,
+					Line:     callPos.Line,
+					Column:   callPos.Column,
+				})
+			}
+
+			if callee != "" {
+				// Skip edges for calls whose Fun expression we couldn't
+				// resolve to any useful name. Previously calleeString
+				// returned the literal "<complex call>" for these and
+				// that string surfaced verbatim in callees/concurrency
+				// output, polluting every report with parser jargon.
+				result.Calls = append(result.Calls, graph.CallEdge{
+					CallerSymbolID: sym.ID,
+					CallerName:     callerName,
+					CalleeRaw:      callee,
+					File:           relPath,
+					Line:           callPos.Line,
+					Column:         callPos.Column,
+					ReturnUsage:    returnUsageMap[call.Pos()],
+				})
+			}
+
+			// Additionally, emit "potential call" edges for any function or
+			// method value passed as an argument to this call. Without these,
+			// reachability analysis loses entire chains of middleware-wrapped
+			// handlers, callbacks (jwt KeyFunc, MCP tool handlers, http
+			// middleware, table-driven test scenarios, etc.) because gograph
+			// has no way to know the callee will eventually invoke them.
+			//
+			// This is a deliberate, conservative over-approximation: a
+			// false-positive edge (treating a passed-but-never-invoked value
+			// as called) is strictly safer than a missing edge (treating live
+			// callback code as dead). The reuse of extractHandlerRefs keeps
+			// the recovery logic in one place — the helper recursively walks
+			// nested call expressions, so `wrap1(wrap2(h.method))` correctly
+			// yields an edge to `h.method`.
+			for _, ref := range extractCallableRefs(call) {
+				result.Calls = append(result.Calls, graph.CallEdge{
+					CallerSymbolID: sym.ID,
+					CallerName:     callerName,
+					CalleeRaw:      ref,
+					File:           relPath,
+					Line:           callPos.Line,
+					Column:         callPos.Column,
+					Potential:      true,
+				})
+			}
+			return true
+		})
+
+		// Mutations Extraction
+		ast.Inspect(d.Body, func(n ast.Node) bool {
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok {
+				return true
+			}
+			// Function-value-as-RHS edge emission. Patterns covered:
+			//   encoderConfig.EncodeLevel = coloredLevelEncoder
+			//   opts.OnEvent = h.method
+			//   localFn := h.method
+			//   x, y := f, g
+			//   opts := Config{OnEvent: h.method}  // CompositeLit RHS
+			// All of these put a function value somewhere that will be
+			// invoked later by another code path. Emit a call edge from the
+			// enclosing function so reachability tracks the value through
+			// the assignment. See Bug 1 in the gograph audit.
+			for _, rhs := range assign.Rhs {
+				var refs []string
+				collectFuncRefs(rhs, &refs)
+				for _, ref := range refs {
+					result.Calls = append(result.Calls, graph.CallEdge{
+						CallerSymbolID: sym.ID,
+						CallerName:     callerName,
+						CalleeRaw:      ref,
+						File:           relPath,
+						Line:           fset.Position(assign.Pos()).Line,
+						Column:         fset.Position(assign.Pos()).Column,
+						Potential:      true,
+					})
+				}
+			}
+			// Only track actual assignments, not declarations (:=) for global mutations
+			isDecl := assign.Tok == token.DEFINE
+
+			for _, lhs := range assign.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok {
+					typeName := mutationTypes[mutationValueName(sel.X)]
+					result.Mutations = append(result.Mutations, graph.MutationEdge{
+						Field:    sel.Sel.Name,
+						TypeName: typeName,
+						Function: callerName,
+						File:     relPath,
+						Line:     fset.Position(assign.Pos()).Line,
+					})
+				} else if id, ok := lhs.(*ast.Ident); ok && !isDecl && packageValues[id.Name] {
+					result.Mutations = append(result.Mutations, graph.MutationEdge{
+						Field:    id.Name,
+						Function: callerName,
+						File:     relPath,
+						Line:     fset.Position(assign.Pos()).Line,
+					})
+				}
+			}
+			return true
+		})
+
+		// Struct Literal Extraction — finds Foo{...} composite literal sites.
+		ast.Inspect(d.Body, func(n ast.Node) bool {
+			lit, ok := n.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			typeName := compositeLitTypeName(lit)
+			if typeName == "" {
+				return true
+			}
+			result.Literals = append(result.Literals, graph.LiteralEdge{
+				TypeName: typeName,
+				Function: callerName,
+				File:     relPath,
+				Line:     fset.Position(lit.Pos()).Line,
+			})
+			return true
+		})
+	}
+}
+
+func functionContextNames(d *ast.FuncDecl) map[string]bool {
+	names := make(map[string]bool)
+	if d == nil || d.Type == nil || d.Type.Params == nil {
+		return names
+	}
+	for _, field := range d.Type.Params.List {
+		fieldType := strings.ToLower(typeString(field.Type))
+		if fieldType != "context.context" && !strings.HasSuffix(fieldType, ".context") {
+			continue
+		}
+		for _, name := range field.Names {
+			names[name.Name] = true
+		}
+	}
+	return names
+}
+
+func isContextArgument(expr ast.Expr, contextNames map[string]bool) bool {
+	switch value := expr.(type) {
+	case *ast.Ident:
+		return contextNames[value.Name] || strings.EqualFold(value.Name, "ctx") || strings.EqualFold(value.Name, "context")
+	case *ast.SelectorExpr:
+		return strings.EqualFold(value.Sel.Name, "ctx") || strings.EqualFold(value.Sel.Name, "context")
+	case *ast.CallExpr:
+		callee := strings.ToLower(calleeString(value))
+		return strings.HasSuffix(callee, ".context") || callee == "context.background" || callee == "context.todo"
+	case *ast.ParenExpr:
+		return isContextArgument(value.X, contextNames)
+	default:
+		return false
+	}
+}
+
+// buildReturnUsageMap walks a function body at the statement level and returns
+// a map from each direct CallExpr position to a usage label describing how the
+// caller consumes the call's return value.
+// Values: "discarded", "assigned", "partially_ignored", "returned",
+//
+//	"goroutine", "deferred". Calls nested inside other expressions are
+//	not recorded (they are "passed" by convention at query time).
+func buildReturnUsageMap(body *ast.BlockStmt) map[token.Pos]string {
+	m := make(map[token.Pos]string)
+	if body == nil {
+		return m
+	}
+	classifyStmtListUsage(body.List, m)
+	return m
+}
+
+func classifyStmtListUsage(stmts []ast.Stmt, m map[token.Pos]string) {
+	for _, s := range stmts {
+		classifyOneStmtUsage(s, m)
+	}
+}
+
+func classifyOneStmtUsage(stmt ast.Stmt, m map[token.Pos]string) {
+	switch s := stmt.(type) {
+	case *ast.ExprStmt:
+		if call, ok := s.X.(*ast.CallExpr); ok {
+			m[call.Pos()] = "discarded"
+		}
+	case *ast.AssignStmt:
+		for _, rhs := range s.Rhs {
+			if call, ok := rhs.(*ast.CallExpr); ok {
+				hasBlank := false
+				for _, lhs := range s.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok && id.Name == "_" {
+						hasBlank = true
+						break
+					}
+				}
+				if hasBlank {
+					m[call.Pos()] = "partially_ignored"
+				} else {
+					m[call.Pos()] = "assigned"
+				}
+			}
+		}
+	case *ast.ReturnStmt:
+		for _, res := range s.Results {
+			if call, ok := res.(*ast.CallExpr); ok {
+				m[call.Pos()] = "returned"
+			}
+		}
+	case *ast.GoStmt:
+		m[s.Call.Pos()] = "goroutine"
+	case *ast.DeferStmt:
+		m[s.Call.Pos()] = "deferred"
+	case *ast.IfStmt:
+		if s.Init != nil {
+			classifyOneStmtUsage(s.Init, m)
+		}
+		classifyStmtListUsage(s.Body.List, m)
+		if s.Else != nil {
+			if block, ok := s.Else.(*ast.BlockStmt); ok {
+				classifyStmtListUsage(block.List, m)
+			} else {
+				classifyOneStmtUsage(s.Else, m)
+			}
+		}
+	case *ast.ForStmt:
+		if s.Init != nil {
+			classifyOneStmtUsage(s.Init, m)
+		}
+		if s.Post != nil {
+			classifyOneStmtUsage(s.Post, m)
+		}
+		classifyStmtListUsage(s.Body.List, m)
+	case *ast.RangeStmt:
+		classifyStmtListUsage(s.Body.List, m)
+	case *ast.SwitchStmt:
+		if s.Init != nil {
+			classifyOneStmtUsage(s.Init, m)
+		}
+		for _, c := range s.Body.List {
+			if cc, ok := c.(*ast.CaseClause); ok {
+				classifyStmtListUsage(cc.Body, m)
+			}
+		}
+	case *ast.TypeSwitchStmt:
+		if s.Init != nil {
+			classifyOneStmtUsage(s.Init, m)
+		}
+		for _, c := range s.Body.List {
+			if cc, ok := c.(*ast.CaseClause); ok {
+				classifyStmtListUsage(cc.Body, m)
+			}
+		}
+	case *ast.SelectStmt:
+		for _, c := range s.Body.List {
+			if cc, ok := c.(*ast.CommClause); ok {
+				if cc.Comm != nil {
+					classifyOneStmtUsage(cc.Comm, m)
+				}
+				classifyStmtListUsage(cc.Body, m)
+			}
+		}
+	case *ast.BlockStmt:
+		classifyStmtListUsage(s.List, m)
+	}
+}
+
+// compositeLitTypeName returns the type name from a composite literal, or ""
+// if the literal has no explicit type (anonymous) or is not a named struct type.
+func compositeLitTypeName(lit *ast.CompositeLit) string {
+	if lit.Type == nil {
+		return ""
+	}
+	switch t := lit.Type.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	}
+	return ""
+}
+
+// receiverString converts an AST receiver type expression to a short string.
+//
+// Handles four forms a method receiver can take:
+//   - *ast.Ident          — non-generic receiver:    func (c Cache) ...
+//   - *ast.StarExpr       — pointer:                 func (c *Cache) ...
+//   - *ast.IndexExpr      — single-param generic:    func (c *List[T]) ...
+//   - *ast.IndexListExpr  — multi-param generic:     func (c *Cache[K, V]) ...
+//
+// Without the IndexListExpr case, multi-param generic methods fell through
+// to the %T default and produced symbol IDs like
+// "pkg::(**ast.IndexListExpr).Get" — gibberish that broke gograph's symbol
+// table for any modern Go codebase using parametric data structures
+// (Bug 9.A — discovered via synthetic test repo when Bug 6 closed).
+func receiverString(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.StarExpr:
+		return "*" + receiverString(t.X)
+	case *ast.Ident:
+		return t.Name
+	case *ast.IndexExpr:
+		return receiverString(t.X)
+	case *ast.IndexListExpr:
+		return receiverString(t.X)
+	default:
+		return fmt.Sprintf("%T", expr)
+	}
+}
+
+// calleeString converts a call expression to a compact string representation.
+func calleeString(call *ast.CallExpr) string {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name
+	case *ast.SelectorExpr:
+		obj := exprName(fn.X)
+		if obj == "" {
+			return fn.Sel.Name
+		}
+		return obj + "." + fn.Sel.Name
+	case *ast.CallExpr:
+		// Curried/returned-function invocation: getFunc()() — recurse to
+		// extract the innermost callable name. The outer call's result is
+		// the callee here; if we can identify what it returns, that's the
+		// useful symbol to attribute.
+		return calleeString(fn)
+	case *ast.IndexExpr:
+		// Generic function instantiation as callee: Foo[int]() or
+		// fnMap[key](). For instantiation, fn.X is the function reference;
+		// for map/slice indexing, fn.X is the container and we can't
+		// statically know the value. Either way, fn.X is the best we have.
+		switch x := fn.X.(type) {
+		case *ast.Ident:
+			return x.Name
+		case *ast.SelectorExpr:
+			return exprName(x)
+		}
+		return ""
+	case *ast.IndexListExpr:
+		// Generic function with multiple type parameters: Foo[A, B]().
+		switch x := fn.X.(type) {
+		case *ast.Ident:
+			return x.Name
+		case *ast.SelectorExpr:
+			return exprName(x)
+		}
+		return ""
+	case *ast.TypeAssertExpr:
+		// Type-asserted call: x.(*T).Method() — fn is the type assertion;
+		// the method selector is one level out and already handled by the
+		// SelectorExpr case above. If we land here it means the assertion
+		// itself is being invoked (function-typed assertion), which is
+		// rare and unresolvable without type info — return empty.
+		return ""
+	case *ast.ParenExpr:
+		// (someExpr)() — strip parens and recurse.
+		return calleeString(&ast.CallExpr{Fun: fn.X})
+	case *ast.FuncLit:
+		// Immediately-invoked function literal: func(){...}(). No symbol
+		// name to attribute; return empty so the edge is dropped rather
+		// than polluting downstream output with a placeholder.
+		return ""
+	default:
+		// Unknown shape — return empty so the caller can decide to skip the
+		// edge. Returning a placeholder like "<complex call>" caused that
+		// literal to leak verbatim into user-facing output (callees,
+		// concurrency, etc.).
+		return ""
+	}
+}
+
+// extractHandlerRefs walks a CallExpr's arguments recursively and returns
+// any callable references found — method values (h.method), qualified
+// function references (pkg.Func), or bare function identifiers.
+//
+// Used by the HTTP-route extractor and by call-edge extraction to recover
+// the *real* handler/callback from indirection patterns like:
+//
+//	mux.HandleFunc("/p", guard(h.method))            // wrapper call
+//	mux.HandleFunc("/p", wrap1(wrap2(h.method)))     // nested wrappers
+//	register(opts{OnSuccess: h.method})              // function value in struct literal
+//	jwt.Parse(token, km.keyFunc)                     // method value as arg
+//
+// where the inner method value is what will actually be invoked later. Without
+// this, gograph would record only the outer call's name and downstream
+// reachability would never mark the inner method as reachable.
+//
+// Returned strings are in `receiver.method` or `pkg.func` form (best-
+// effort via exprName). They flow through search.normalizeSymbolName
+// during orphan analysis, which strips them down to the bare
+// method/function name for matching against symbol IDs.
+func extractHandlerRefs(call *ast.CallExpr) []string {
+	var refs []string
+	for _, a := range call.Args {
+		collectRefs(a, &refs, true)
+	}
+	return refs
+}
+
+// extractCallableRefs returns best-effort callback candidates for graph edges.
+// Unlike route labels, these references affect reachability, so identifiers
+// that the parser has already resolved as ordinary variables are excluded.
+func extractCallableRefs(call *ast.CallExpr) []string {
+	var refs []string
+	for _, a := range call.Args {
+		collectFuncRefs(a, &refs)
+	}
+	return refs
+}
+
+// collectFuncRefs walks an arbitrary expression and appends every
+// function/method-value reference it finds to `out`. It is the workhorse
+// behind extractHandlerRefs and is also used directly by AssignStmt and
+// composite-literal scanners to recover function values that reach
+// later-invoked sites through fields and assignments rather than direct
+// call arguments.
+//
+// Recurses through:
+//   - *ast.CallExpr      — nested wrappers like wrap1(wrap2(h.method))
+//   - *ast.CompositeLit  — struct/map/slice literals carrying function fields,
+//     e.g. opts{OnEvent: h.method}
+//   - *ast.KeyValueExpr  — for each key-value pair, scan the value
+//   - *ast.UnaryExpr     — &Foo{...} pointer-to-literal
+//   - *ast.ParenExpr     — (h.method)
+//
+// Records:
+//   - *ast.Ident         — bare function reference (filters nil/true/false/iota)
+//   - *ast.SelectorExpr  — method value or qualified function (h.method, pkg.Foo)
+func collectFuncRefs(e ast.Expr, out *[]string) {
+	collectRefs(e, out, true)
+}
+
+func collectRefs(e ast.Expr, out *[]string, requireCallable bool) {
+	switch x := e.(type) {
+	case *ast.Ident:
+		switch x.Name {
+		case "nil", "true", "false", "iota", "":
+			return
+		}
+		if requireCallable && !identMayBeCallable(x) {
+			return
+		}
+		*out = append(*out, x.Name)
+	case *ast.SelectorExpr:
+		if n := exprName(x); n != "" {
+			*out = append(*out, n)
+		}
+	case *ast.CallExpr:
+		for _, a := range x.Args {
+			collectRefs(a, out, requireCallable)
+		}
+	case *ast.CompositeLit:
+		for _, elt := range x.Elts {
+			collectRefs(elt, out, requireCallable)
+		}
+	case *ast.KeyValueExpr:
+		// Map/struct field — only the value side can be a function ref;
+		// the key is either a field name (Ident) or a constant (BasicLit).
+		collectRefs(x.Value, out, requireCallable)
+	case *ast.UnaryExpr:
+		// &Foo{...} — recurse into operand.
+		collectRefs(x.X, out, requireCallable)
+	case *ast.ParenExpr:
+		collectRefs(x.X, out, requireCallable)
+	}
+}
+
+func identMayBeCallable(id *ast.Ident) bool {
+	if id.Obj == nil {
+		// Cross-file declarations are not resolved by go/parser. BuildGraph
+		// validates these candidates against the complete symbol table later.
+		return true
+	}
+	if id.Obj.Kind == ast.Fun {
+		return true
+	}
+	if id.Obj.Kind != ast.Var {
+		return false
+	}
+
+	switch decl := id.Obj.Decl.(type) {
+	case *ast.Field:
+		_, ok := decl.Type.(*ast.FuncType)
+		return ok
+	case *ast.ValueSpec:
+		if _, ok := decl.Type.(*ast.FuncType); ok {
+			return true
+		}
+		for _, value := range decl.Values {
+			if _, ok := value.(*ast.FuncLit); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// exprName returns a best-effort single-identifier name for an expression.
+func exprName(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		prefix := exprName(e.X)
+		if prefix == "" {
+			return e.Sel.Name
+		}
+		return prefix + "." + e.Sel.Name
+	default:
+		return ""
+	}
+}
+
+// funcSignature builds a best-effort human-readable signature string.
+func funcSignature(d *ast.FuncDecl) string {
+	var sb strings.Builder
+	sb.WriteString("func ")
+	if d.Recv != nil && len(d.Recv.List) > 0 {
+		sb.WriteString("(")
+		sb.WriteString(receiverString(d.Recv.List[0].Type))
+		sb.WriteString(") ")
+	}
+	sb.WriteString(d.Name.Name)
+	if d.Type != nil && d.Type.TypeParams != nil {
+		sb.WriteString("[")
+		sb.WriteString(fieldListString(d.Type.TypeParams))
+		sb.WriteString("]")
+	}
+	sb.WriteString("(")
+	if d.Type.Params != nil {
+		sb.WriteString(fieldListString(d.Type.Params))
+	}
+	sb.WriteString(")")
+	if d.Type.Results != nil && len(d.Type.Results.List) > 0 {
+		sb.WriteString(" (")
+		sb.WriteString(fieldListString(d.Type.Results))
+		sb.WriteString(")")
+	}
+	return sb.String()
+}
+
+// funcTypeSignature builds just the parameter and return type signature (names omitted for duck-typing)
+func funcTypeSignature(ft *ast.FuncType) string {
+	var sb strings.Builder
+	sb.WriteString("func")
+	if ft.TypeParams != nil {
+		sb.WriteString("[")
+		sb.WriteString(fieldListString(ft.TypeParams))
+		sb.WriteString("]")
+	}
+	sb.WriteString("(")
+	if ft.Params != nil {
+		sb.WriteString(typeOnlyFieldListString(ft.Params))
+	}
+	sb.WriteString(")")
+	if ft.Results != nil && len(ft.Results.List) > 0 {
+		sb.WriteString(" (")
+		sb.WriteString(typeOnlyFieldListString(ft.Results))
+		sb.WriteString(")")
+	}
+	return sb.String()
+}
+
+// typeOnlyFieldListString converts an ast.FieldList to a string of types only, ignoring parameter names.
+func typeOnlyFieldListString(fl *ast.FieldList) string {
+	parts := make([]string, 0, len(fl.List))
+	for _, f := range fl.List {
+		typStr := typeString(f.Type)
+		if len(f.Names) == 0 {
+			parts = append(parts, typStr)
+		} else {
+			for range f.Names {
+				parts = append(parts, typStr)
+			}
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// fieldListString converts an ast.FieldList to a compact string.
+func fieldListString(fl *ast.FieldList) string {
+	parts := make([]string, 0, len(fl.List))
+	for _, f := range fl.List {
+		typStr := typeString(f.Type)
+		if len(f.Names) == 0 {
+			parts = append(parts, typStr)
+		} else {
+			names := make([]string, len(f.Names))
+			for i, n := range f.Names {
+				names[i] = n.Name
+			}
+			parts = append(parts, strings.Join(names, ", ")+" "+typStr)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// typeString converts a type expression to a compact string.
+func typeString(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return "*" + typeString(t.X)
+	case *ast.ArrayType:
+		return "[]" + typeString(t.Elt)
+	case *ast.MapType:
+		return "map[" + typeString(t.Key) + "]" + typeString(t.Value)
+	case *ast.SelectorExpr:
+		return exprName(t.X) + "." + t.Sel.Name
+	case *ast.Ellipsis:
+		return "..." + typeString(t.Elt)
+	case *ast.InterfaceType:
+		return "interface{}"
+	case *ast.FuncType:
+		return "func(...)"
+	case *ast.ChanType:
+		return "chan " + typeString(t.Value)
+	case *ast.IndexExpr:
+		return typeString(t.X) + "[" + typeString(t.Index) + "]"
+	case *ast.IndexListExpr:
+		indexes := make([]string, 0, len(t.Indices))
+		for _, index := range t.Indices {
+			indexes = append(indexes, typeString(index))
+		}
+		return typeString(t.X) + "[" + strings.Join(indexes, ", ") + "]"
+	case *ast.UnaryExpr:
+		return t.Op.String() + typeString(t.X)
+	case *ast.BinaryExpr:
+		return typeString(t.X) + " " + t.Op.String() + " " + typeString(t.Y)
+	case *ast.ParenExpr:
+		return "(" + typeString(t.X) + ")"
+	default:
+		return "_"
+	}
+}
+
+// envAccessors is the set of function call patterns we detect for env reads.
+var envAccessors = map[string]bool{
+	"os.Getenv":       true,
+	"os.LookupEnv":    true,
+	"viper.GetString": true,
+	"viper.GetBool":   true,
+	"viper.GetInt":    true,
+	"viper.Get":       true,
+}
+
+// envRead attempts to detect an environment variable read in a call expression.
+func envRead(call *ast.CallExpr, callee string, line int, file, fn string) (graph.EnvRead, bool) {
+	if !envAccessors[callee] {
+		return graph.EnvRead{}, false
+	}
+	if len(call.Args) == 0 {
+		return graph.EnvRead{}, false
+	}
+	lit, ok := call.Args[0].(*ast.BasicLit)
+	if !ok {
+		return graph.EnvRead{}, false
+	}
+	key := strings.Trim(lit.Value, `"`)
+	return graph.EnvRead{
+		Key:      key,
+		Accessor: callee,
+		File:     file,
+		Line:     line,
+		Function: fn,
+	}, true
+}
+
+// extractHTTPMethod checks whether a call expression is a package-level
+// net/http client call and returns the HTTP method (GET, POST, etc.) if so.
+//
+// Only unambiguous package-level calls are detected (http.Get, http.Post, etc.).
+// *http.Client method calls (client.Get, client.Do) are not detected here
+// because they cannot be reliably distinguished from other types' methods
+// without go/types type information. Support for those may be added in a
+// future --precise mode enhancement.
+// extractStaticSegments parses a URL string and returns non-empty path segments.
+func extractStaticSegments(rawURL string) []string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	path := strings.Trim(u.Path, "/")
+	if path == "" {
+		return nil
+	}
+	return strings.Split(path, "/")
+}
+
+const (
+	maxStaticStringDepth = 64
+	maxStaticStringBytes = 1 << 20
+)
+
+// resolveStaticStringLiteral resolves strings that the Go parser can prove from
+// syntax alone. Object identity is used instead of identifier spelling so a
+// shadowed local cannot accidentally inherit the value of another declaration.
+// staticStringObject deliberately uses parser-provided object identity for
+// plain identifiers. The general go/ast object model is deprecated because it
+// cannot resolve type-dependent syntax, but these SQL bindings are limited to
+// lexical identifier declarations and assignments where that ambiguity does
+// not exist. Object identity keeps shadowed variables distinct without adding
+// a type-checking dependency to the AST fallback parser.
+//
+//lint:ignore SA1019 See the bounded plain-identifier use described above.
+type staticStringObject = ast.Object //nolint:staticcheck // See the bounded plain-identifier use described above.
+
+func resolveStaticStringLiteral(body *ast.BlockStmt, expr ast.Expr, before token.Pos) (string, bool) {
+	if expr == nil {
+		return "", false
+	}
+	return evalStaticString(body, expr, before, make(map[*staticStringObject]bool), 0)
+}
+
+func evalStaticString(body *ast.BlockStmt, expr ast.Expr, before token.Pos, resolving map[*staticStringObject]bool, depth int) (string, bool) {
+	if expr == nil || depth >= maxStaticStringDepth {
+		return "", false
+	}
+
+	switch value := expr.(type) {
+	case *ast.BasicLit:
+		if value.Kind != token.STRING {
+			return "", false
+		}
+		decoded, err := strconv.Unquote(value.Value)
+		if err != nil || len(decoded) > maxStaticStringBytes {
+			return "", false
+		}
+		return decoded, true
+	case *ast.ParenExpr:
+		return evalStaticString(body, value.X, before, resolving, depth+1)
+	case *ast.BinaryExpr:
+		if value.Op != token.ADD {
+			return "", false
+		}
+		left, leftOK := evalStaticString(body, value.X, before, resolving, depth+1)
+		right, rightOK := evalStaticString(body, value.Y, before, resolving, depth+1)
+		if !leftOK || !rightOK || len(left) > maxStaticStringBytes-len(right) {
+			return "", false
+		}
+		return left + right, true
+	case *ast.Ident:
+		if value.Obj == nil || resolving[value.Obj] {
+			return "", false
+		}
+		candidate, candidatePos, ok := staticStringDeclaration(value.Obj)
+		if ok && staticStringReassigned(body, value.Obj, candidatePos, before) {
+			return "", false
+		}
+		if !ok {
+			candidate, candidatePos, ok = directStaticAssignment(body, value.Obj, before)
+		}
+		if !ok || candidatePos >= before {
+			return "", false
+		}
+		resolving[value.Obj] = true
+		resolved, resolvedOK := evalStaticString(body, candidate, candidatePos, resolving, depth+1)
+		delete(resolving, value.Obj)
+		return resolved, resolvedOK
+	default:
+		return "", false
+	}
+}
+
+func staticStringReassigned(body *ast.BlockStmt, obj *staticStringObject, after, before token.Pos) bool {
+	if body == nil {
+		return false
+	}
+	reassigned := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if reassigned {
+			return false
+		}
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || assign.Pos() <= after || assign.Pos() >= before {
+			return true
+		}
+		for _, lhs := range assign.Lhs {
+			if id, isIdent := lhs.(*ast.Ident); isIdent && id.Obj == obj {
+				reassigned = true
+				return false
+			}
+		}
+		return true
+	})
+	return reassigned
+}
+
+func directStaticAssignment(body *ast.BlockStmt, obj *staticStringObject, before token.Pos) (ast.Expr, token.Pos, bool) {
+	block := innermostBlockAt(body, before)
+	if block == nil {
+		return nil, token.NoPos, false
+	}
+	var candidate ast.Expr
+	var candidatePos token.Pos
+	count := 0
+	for _, statement := range block.List {
+		if statement.Pos() >= before {
+			break
+		}
+		assign, ok := statement.(*ast.AssignStmt)
+		if !ok {
+			continue
+		}
+		for i, lhs := range assign.Lhs {
+			id, isIdent := lhs.(*ast.Ident)
+			if !isIdent || id.Obj != obj {
+				continue
+			}
+			value, hasValue := expressionAt(assign.Rhs, i, len(assign.Lhs))
+			if !hasValue {
+				return nil, token.NoPos, false
+			}
+			candidate = value
+			candidatePos = assign.Pos()
+			count++
+		}
+	}
+	return candidate, candidatePos, count == 1
+}
+
+func innermostBlockAt(body *ast.BlockStmt, pos token.Pos) *ast.BlockStmt {
+	var selected *ast.BlockStmt
+	ast.Inspect(body, func(n ast.Node) bool {
+		block, ok := n.(*ast.BlockStmt)
+		if !ok {
+			return true
+		}
+		if block.Pos() <= pos && pos <= block.End() {
+			selected = block
+			return true
+		}
+		return false
+	})
+	return selected
+}
+
+func staticStringDeclaration(obj *staticStringObject) (ast.Expr, token.Pos, bool) {
+	switch decl := obj.Decl.(type) {
+	case *ast.ValueSpec:
+		for i, name := range decl.Names {
+			if name.Obj != obj {
+				continue
+			}
+			value, ok := expressionAt(decl.Values, i, len(decl.Names))
+			return value, decl.Pos(), ok
+		}
+	case *ast.AssignStmt:
+		for i, lhs := range decl.Lhs {
+			id, isIdent := lhs.(*ast.Ident)
+			if !isIdent || id.Obj != obj {
+				continue
+			}
+			value, ok := expressionAt(decl.Rhs, i, len(decl.Lhs))
+			return value, decl.Pos(), ok
+		}
+	}
+	return nil, token.NoPos, false
+}
+
+func expressionAt(values []ast.Expr, index, names int) (ast.Expr, bool) {
+	if len(values) == names && index < len(values) {
+		return values[index], true
+	}
+	if len(values) == 1 && names == 1 {
+		return values[0], true
+	}
+	return nil, false
+}
