@@ -1,0 +1,69 @@
+baseURL = "https://gograph.identuum.ai/"
+locale = "en-us"
+title = "gograph – Go Codebase Analysis & MCP Server"
+theme = "PaperMod"
+relativeURLs = false
+canonifyURLs = false
+
+enableRobotsTXT = true
+
+[params]
+  description = "gograph is a local structural graph and MCP server for safer Go refactors, repository analysis, and coding-agent workflows."
+  author = "Ozgur Demir"
+  images = ["/images/gograph-social-preview.png"]
+  defaultTheme = "auto"
+  ShowThemeToggle = true
+  ShowReadingTime = true
+  ShowShareButtons = false
+  ShowCodeCopyButtons = true
+  ShowBreadCrumbs = true
+  disableAnchoredHeadings = false
+  comments = false
+
+  homeInfoParams = { Title = "gograph", Content = "A local structural graph for safer Go refactors, repository-level analysis, and coding-agent workflows — from the terminal or any compatible MCP client." }
+
+  [params.schema]
+    publisherType = "Person"
+
+[[params.socialIcons]]
+  name = "github"
+  url = "https://github.com/ozgurcd/gograph"
+
+[menu]
+  [[menu.main]]
+    name = "Try Demo"
+    url = "/demo/"
+    weight = 1
+  [[menu.main]]
+    name = "Get Started"
+    url = "/docs/getting-started/"
+    weight = 2
+  [[menu.main]]
+    name = "Commands"
+    url = "/docs/command-reference/"
+    weight = 3
+  [[menu.main]]
+    name = "AI Integration"
+    url = "/docs/agent-integration/"
+    weight = 4
+  [[menu.main]]
+    name = "Workflows"
+    url = "/docs/workflows/"
+    weight = 5
+  [[menu.main]]
+    name = "Evidence"
+    url = "/benchmarks/"
+    weight = 6
+  [[menu.main]]
+    name = "Blog"
+    url = "/posts/"
+    weight = 7
+  [[menu.main]]
+    name = "GitHub"
+    url = "https://github.com/ozgurcd/gograph"
+    weight = 8
+
+[markup]
+  [markup.goldmark]
+    [markup.goldmark.renderer]
+      unsafe = true
